@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# ESP-IDF build
+m5paper_hw/build/
+m5paper_hw/managed_components/
+m5paper_hw/dependencies.lock
+m5paper_hw/sdkconfig.old
+
+# IDE
+.idea/
+.vscode/
+
+# Claude/OMC
+.claudine/
+.history/
+.omc/
+
+# Secrets
+m5paper_hw/main/secrets.h
+
+# Design source files
+*.afphoto
+*.afphoto~lock~

@@ -1,0 +1,12 @@
+# M5PaperS3 board configuration
+# Flash: 16MB
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# PSRAM: 8MB OPI (required by M5PaperS3)
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# Partition table: use larger app partition with 16MB flash
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y

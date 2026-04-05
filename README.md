@@ -1,6 +1,6 @@
 # M5Paper S3 Home Dashboard
 
-E-ink home dashboard for the M5Paper S3 (ESP32-S3, 960×540 e-ink display). Shows weather, clothing recommendations, temperature/rain chart, and bus departures — updated every 15 minutes via deep sleep wake cycle.
+E-ink home dashboard for the M5Paper S3 (ESP32-S3, 960×540 e-ink display). Shows weather, clothing recommendations, temperature/rain chart, and bus departures — with adaptive refresh rates to maximize battery life.
 
 ## Screenshots
 
@@ -28,7 +28,8 @@ E-ink home dashboard for the M5Paper S3 (ESP32-S3, 960×540 e-ink display). Show
 
 ```
 ├── backend/             Python FastAPI backend
-│   └── main.py          Dashboard API endpoint
+│   ├── main.py          Dashboard API endpoint
+│   └── test_main.py     Unit tests (pytest)
 ├── m5paper_hw/          ESP-IDF firmware for M5Paper S3
 │   └── main/
 │       ├── main.cpp             Rendering + WiFi + HTTP fetch
@@ -50,9 +51,23 @@ E-ink home dashboard for the M5Paper S3 (ESP32-S3, 960×540 e-ink display). Show
 - **Weather**: Current outdoor temperature, weather icon, wind speed/direction
 - **Clothing**: 5 recommendation cards (head, top, pants, hands, shoes) based on forecast
 - **Chart**: 24h temperature line + rain bars (mm) starting from current hour
-- **Bus departures**: Next 5 departures from configured stop (ZVV)
+- **Bus departures**: Next departures from configured stop (ZVV)
+  - **High mode**: Individual departure rows (up to 5)
+  - **Low mode**: Compact view — one line per destination with all times in the next hour
 - **Battery**: Real-time battery level from hardware
-- **Deep sleep**: Wakes every 15 minutes to refresh
+
+## Refresh Schedule
+
+The backend determines the refresh mode based on time-of-day and weekday/weekend:
+
+| Period | Weekday | Weekend | Interval |
+|--------|---------|---------|----------|
+| 05:00–09:00 | High (15 min) | High (15 min) | 15 min |
+| 09:00–17:00 | Low (60 min) | High (15 min) | varies |
+| 17:00–21:00 | Low (60 min) | Low (60 min) | 60 min |
+| 21:00–05:00 | Sleep | Sleep | until 05:00 |
+
+Estimated battery life: **2–4 weeks** on a single charge (1900 mAh).
 
 ## Prerequisites
 
@@ -104,14 +119,32 @@ WEATHER_LONGITUDE=8.482
 BUS_STOP_NAME=Zürich, Rautistrasse
 ```
 
-### Firmware (`m5paper_hw/main/main.cpp`)
+### Firmware (`m5paper_hw/main/secrets.h`)
+
+Copy `secrets.h.example` to `secrets.h` and fill in:
 
 ```c
 #define WIFI_SSID       "your-ssid"
 #define WIFI_PASS       "your-password"
 #define API_URL         "https://your-backend/dashboard"
-#define SLEEP_MINUTES   15
+```
+
+### Running Tests
+
+```bash
+cd backend
+.venv/bin/python -m pytest test_main.py -v
+```
+
+### Deployment (Cloud Run)
+
+```bash
+cd backend
+gcloud run deploy m5paper-dashboard --source . --region europe-west6 --allow-unauthenticated
+gcloud run services update m5paper-dashboard --region europe-west6 \
+  --set-env-vars "KACHELMANN_API_KEY=..." \
+  --set-env-vars "BUS_STOP_NAME=Zürich, Rautistrasse"
 ```
 
 ---
-Updated: 2026-04-04, sha: 82a1a0d
+Updated: 2026-04-05

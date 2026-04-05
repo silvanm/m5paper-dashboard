@@ -41,6 +41,12 @@ class BusDeparture(BaseModel):
     platform: str
 
 
+class CompactBusDeparture(BaseModel):
+    line: str
+    dest: str
+    times: list[str]
+
+
 class ClothingItem(BaseModel):
     category: str       # KOPF, OBERTEIL, HOSE, HAENDE, SCHUHE
     sprite: str         # sprite filename without extension (e.g. "cap", "raincoat")
@@ -50,6 +56,8 @@ class ClothingItem(BaseModel):
 class DashboardData(BaseModel):
     timestamp: str
     next_update: str
+    refresh_mode: str           # "high", "low", "sleep"
+    sleep_minutes: int          # actual sleep duration for device
     temp_outdoor: float | None
     wind_kmh: int | None
     wind_dir: str | None
@@ -65,6 +73,7 @@ class DashboardData(BaseModel):
     clothing: list[ClothingItem]
     bus_stop_name: str
     bus_departures: list[BusDeparture]
+    bus_departures_compact: list[CompactBusDeparture]
     battery_pct: int
     wifi_ok: bool
     weather_api_ok: bool
@@ -305,11 +314,10 @@ def recommend_clothing(
 # --- ZVV Bus Departures ---
 
 
-async def fetch_bus_departures() -> list[dict]:
+async def fetch_bus_departures(limit: int = 15) -> list[dict]:
     """Fetch next bus departures from transport.opendata.ch."""
     url = "https://transport.opendata.ch/v1/stationboard"
-    params = {"station": BUS_STOP_NAME, "limit": 15}
-    hidden_destinations = {"Zürich, Dunkelhölzli"}
+    params = {"station": BUS_STOP_NAME, "limit": limit}
 
     async with httpx.AsyncClient() as client:
         resp = await client.get(url, params=params)
@@ -321,9 +329,9 @@ async def fetch_bus_departures() -> list[dict]:
         departures = []
         for entry in data.get("stationboard", []):
             dest = entry.get("to", "?")
-            if dest in hidden_destinations:
+            if dest in HIDDEN_DESTINATIONS:
                 continue
-            if len(departures) >= 5:
+            if len(departures) >= limit:
                 break
             stop = entry.get("stop", {})
             dep_time = stop.get("departure", "")
@@ -345,6 +353,87 @@ async def fetch_bus_departures() -> list[dict]:
         return departures
 
 
+# --- Refresh Schedule ---
+
+HIDDEN_DESTINATIONS = {"Zürich, Dunkelhölzli"}
+
+
+def get_refresh_schedule(now: datetime) -> tuple[str, int]:
+    """Return (mode, sleep_minutes) based on time of day and weekday/weekend.
+
+    Schedule:
+    - 05:00-09:00 every day: high (15min)
+    - 09:00-17:00 weekends: high (15min)
+    - 09:00-21:00 weekdays: low (60min)
+    - 17:00-21:00 weekends: low (60min)
+    - 21:00-05:00 every day: sleep (until 05:00)
+    """
+    hour = now.hour
+    is_weekend = now.weekday() >= 5  # Saturday=5, Sunday=6
+
+    if hour >= 21 or hour < 5:
+        # Sleep until 05:00
+        if hour >= 21:
+            minutes_until_5 = (24 - hour + 5) * 60 - now.minute
+        else:
+            minutes_until_5 = (5 - hour) * 60 - now.minute
+        return ("sleep", minutes_until_5)
+
+    if 5 <= hour < 9:
+        return ("high", 15)
+
+    if is_weekend and 9 <= hour < 17:
+        return ("high", 15)
+
+    # Weekday 09-21 or weekend 17-21
+    return ("low", 60)
+
+
+def strip_zurich_prefix(dest: str) -> str:
+    """Strip 'Zürich, ' or 'Zürich ' prefix from destination names."""
+    if dest.startswith("Zürich, "):
+        return dest[len("Zürich, "):]
+    if dest.startswith("Zürich ") and not dest.startswith("Zürichs"):
+        return dest[len("Zürich "):]
+    return dest
+
+
+def format_compact_departures(departures: list[dict]) -> list[CompactBusDeparture]:
+    """Group departures by (line, dest), strip Zürich, format times compactly."""
+    from collections import OrderedDict
+
+    groups: OrderedDict[tuple[str, str], list[str]] = OrderedDict()
+
+    for dep in departures:
+        raw_dest = dep.get("dest", "?")
+        if raw_dest in HIDDEN_DESTINATIONS:
+            continue
+        line = dep.get("line", "?")
+        dest = strip_zurich_prefix(raw_dest)
+        time = dep.get("time", "??:??")
+        key = (line, dest)
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(time)
+
+    result = []
+    for (line, dest), times in groups.items():
+        formatted = []
+        prev_hour = None
+        for t in times:
+            hour = t[:2] if len(t) >= 5 else None
+            if prev_hour is None:
+                formatted.append(t)
+            elif hour != prev_hour:
+                formatted.append(t)
+            else:
+                formatted.append(t[2:])  # ":MM"
+            prev_hour = hour
+        result.append(CompactBusDeparture(line=line, dest=dest, times=formatted))
+
+    return result
+
+
 # --- Main endpoint ---
 
 
@@ -353,11 +442,10 @@ async def get_dashboard():
     now = datetime.now(LOCAL_TZ)
     timestamp = now.strftime("%a %d.%m.%Y, %H:%M")
 
-    next_min = (now.minute // 15 + 1) * 15
-    if next_min >= 60:
-        next_update = f"{(now.hour + 1) % 24:02d}:00"
-    else:
-        next_update = f"{now.hour:02d}:{next_min:02d}"
+    from datetime import timedelta
+    refresh_mode, sleep_min = get_refresh_schedule(now)
+    next_time = now + timedelta(minutes=sleep_min)
+    next_update = next_time.strftime("%H:%M")
 
     # Fetch all data sources
     netatmo_ok = True
@@ -388,7 +476,8 @@ async def get_dashboard():
         kachelmann_ok = False
 
     try:
-        bus_deps = await fetch_bus_departures()
+        bus_limit = 30 if refresh_mode == "low" else 15
+        bus_deps = await fetch_bus_departures(limit=bus_limit)
     except Exception as e:
         log.error("Bus fetch error: %s", e)
         bus_deps = []
@@ -407,9 +496,14 @@ async def get_dashboard():
 
     clothing = recommend_clothing(temps_remaining, rain_remaining, weather.get("wind_kmh"))
 
+    # Build compact departures for low-refresh mode
+    bus_departures_compact = format_compact_departures(bus_deps) if refresh_mode == "low" else []
+
     return DashboardData(
         timestamp=timestamp,
         next_update=next_update,
+        refresh_mode=refresh_mode,
+        sleep_minutes=sleep_min,
         temp_outdoor=netatmo.get("temp_outdoor"),
         wind_kmh=weather.get("wind_kmh"),
         wind_dir=weather.get("wind_dir"),
@@ -425,6 +519,7 @@ async def get_dashboard():
         clothing=clothing,
         bus_stop_name=BUS_STOP_NAME,
         bus_departures=[BusDeparture(**d) for d in bus_deps],
+        bus_departures_compact=bus_departures_compact,
         battery_pct=73,  # TODO: report from device
         wifi_ok=True,
         weather_api_ok=kachelmann_ok and netatmo_ok,

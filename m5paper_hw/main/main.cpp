@@ -342,7 +342,7 @@ static void render_dashboard(cJSON *data) {
     d.setTextDatum(top_left);
     snprintf(buf, sizeof(buf), "%.0f / %.0f   Regen bis %.1f mm",
         tmin_j ? tmin_j->valuedouble : 0, tmax_j ? tmax_j->valuedouble : 0, rain_max_mm);
-    d.drawString(buf, tx, ly + 52);
+    d.drawString(buf, tx + temp_w, ly + 52);
 
     // ====== CLOTHING SECTION ======
     int cloth_y = ly + 85;
@@ -513,39 +513,82 @@ static void render_dashboard(cJSON *data) {
     sanitize_utf8(stop_name, cJSON_GetObjectItem(data, "bus_stop_name")->valuestring, sizeof(stop_name));
     d.drawString(stop_name, rx + bus_w - 10, bus_y + 10);
 
-    // Entries
-    cJSON *deps = cJSON_GetObjectItem(data, "bus_departures");
-    int entry_h = 40;
+    const char *refresh_mode = cJSON_GetObjectItem(data, "refresh_mode")->valuestring;
 
-    for (int i = 0; i < cJSON_GetArraySize(deps) && i < 5; i++) {
-        cJSON *dep = cJSON_GetArrayItem(deps, i);
-        int ey = bus_y + 34 + i * entry_h;
+    if (strcmp(refresh_mode, "low") == 0) {
+        // Compact mode: one line per destination with all times
+        cJSON *compact = cJSON_GetObjectItem(data, "bus_departures_compact");
+        int entry_h = 26;
 
-        // Alternating bg
-        if (i % 2 == 0) d.fillRect(rx, ey, bus_w, entry_h - 2, faint);
+        for (int i = 0; i < cJSON_GetArraySize(compact) && i < 8; i++) {
+            cJSON *item = cJSON_GetArrayItem(compact, i);
+            int ey = bus_y + 34 + i * entry_h;
 
-        // Line badge
-        int badge_x = rx + 8, badge_y = ey + 6, badge_w = 36, badge_h = 24;
-        d.fillRect(badge_x, badge_y, badge_w, badge_h, black);
-        d.setTextColor(bg);
-        d.setFont(&fonts::FreeSansBold9pt7b);
-        d.setTextDatum(middle_center);
-        d.drawString(cJSON_GetObjectItem(dep, "line")->valuestring,
-                     badge_x + badge_w / 2, badge_y + badge_h / 2);
+            if (i % 2 == 0) d.fillRect(rx, ey, bus_w, entry_h - 1, faint);
 
-        // Destination
-        char dest[64];
-        sanitize_utf8(dest, cJSON_GetObjectItem(dep, "dest")->valuestring, sizeof(dest));
-        if (strlen(dest) > 20) { dest[20] = '\0'; strcat(dest, ".."); }
-        d.setTextColor(black);
-        d.setFont(&fonts::FreeSans9pt7b);
-        d.setTextDatum(top_left);
-        d.drawString(dest, rx + 52, ey + 10);
+            // Line badge (smaller)
+            int badge_x = rx + 4, badge_y2 = ey + 2, badge_w2 = 30, badge_h2 = 20;
+            d.fillRect(badge_x, badge_y2, badge_w2, badge_h2, black);
+            d.setTextColor(bg);
+            d.setFont(&fonts::FreeSans9pt7b);
+            d.setTextDatum(middle_center);
+            d.drawString(cJSON_GetObjectItem(item, "line")->valuestring,
+                         badge_x + badge_w2 / 2, badge_y2 + badge_h2 / 2);
 
-        // Time
-        d.setFont(&fonts::FreeSansBold12pt7b);
-        d.setTextDatum(top_right);
-        d.drawString(cJSON_GetObjectItem(dep, "time")->valuestring, rx + bus_w - 10, ey + 8);
+            // Destination (compact)
+            char dest[48];
+            sanitize_utf8(dest, cJSON_GetObjectItem(item, "dest")->valuestring, sizeof(dest));
+            if (strlen(dest) > 14) { dest[14] = '\0'; strcat(dest, ".."); }
+            d.setTextColor(black);
+            d.setFont(&fonts::FreeSans9pt7b);
+            d.setTextDatum(top_left);
+            d.drawString(dest, rx + 38, ey + 4);
+
+            // Times (comma-separated)
+            cJSON *times_arr = cJSON_GetObjectItem(item, "times");
+            char times_buf[128] = {};
+            for (int t = 0; t < cJSON_GetArraySize(times_arr); t++) {
+                if (t > 0) strcat(times_buf, ", ");
+                strcat(times_buf, cJSON_GetArrayItem(times_arr, t)->valuestring);
+            }
+            d.setTextColor(dark);
+            d.setTextDatum(top_right);
+            d.drawString(times_buf, rx + bus_w - 6, ey + 4);
+        }
+    } else {
+        // Normal mode: one entry per departure
+        cJSON *deps = cJSON_GetObjectItem(data, "bus_departures");
+        int entry_h = 40;
+
+        for (int i = 0; i < cJSON_GetArraySize(deps) && i < 5; i++) {
+            cJSON *dep = cJSON_GetArrayItem(deps, i);
+            int ey = bus_y + 34 + i * entry_h;
+
+            if (i % 2 == 0) d.fillRect(rx, ey, bus_w, entry_h - 2, faint);
+
+            // Line badge
+            int badge_x = rx + 8, badge_y2 = ey + 6, badge_w2 = 36, badge_h2 = 24;
+            d.fillRect(badge_x, badge_y2, badge_w2, badge_h2, black);
+            d.setTextColor(bg);
+            d.setFont(&fonts::FreeSansBold9pt7b);
+            d.setTextDatum(middle_center);
+            d.drawString(cJSON_GetObjectItem(dep, "line")->valuestring,
+                         badge_x + badge_w2 / 2, badge_y2 + badge_h2 / 2);
+
+            // Destination
+            char dest[64];
+            sanitize_utf8(dest, cJSON_GetObjectItem(dep, "dest")->valuestring, sizeof(dest));
+            if (strlen(dest) > 30) { dest[30] = '\0'; strcat(dest, ".."); }
+            d.setTextColor(black);
+            d.setFont(&fonts::FreeSans9pt7b);
+            d.setTextDatum(top_left);
+            d.drawString(dest, rx + 52, ey + 10);
+
+            // Time
+            d.setFont(&fonts::FreeSansBold12pt7b);
+            d.setTextDatum(top_right);
+            d.drawString(cJSON_GetObjectItem(dep, "time")->valuestring, rx + bus_w - 10, ey + 8);
+        }
     }
 
     // ====== STATUS BAR ======
@@ -560,10 +603,6 @@ static void render_dashboard(cJSON *data) {
     snprintf(buf, sizeof(buf), "WiFi OK  |  Wetter %s  |  ZVV %s",
         w_ok ? "OK" : "ERR", b_ok ? "OK" : "ERR");
     d.drawString(buf, 16, SCREEN_H - 22);
-
-    d.setTextDatum(top_right);
-    snprintf(buf, sizeof(buf), "Nachstes Update ~%s", nu);
-    d.drawString(buf, SCREEN_W - 16, SCREEN_H - 22);
 }
 
 // ---- Main ----
@@ -602,9 +641,12 @@ extern "C" void app_main(void) {
 
     printf("Rendering dashboard...\n");
     render_dashboard(data);
+
+    // Sleep duration determined by backend based on time-of-day/weekday schedule
+    int sleep_minutes = cJSON_GetObjectItem(data, "sleep_minutes")->valueint;
     cJSON_Delete(data);
 
-    printf("Dashboard rendered. Waiting for display to finish...\n");
+    printf("Dashboard rendered. Sleeping for %d minutes...\n", sleep_minutes);
 
     // Wait for e-ink display to finish refreshing before sleeping
     vTaskDelay(pdMS_TO_TICKS(5000));
@@ -612,7 +654,7 @@ extern "C" void app_main(void) {
     // Disconnect WiFi to save power
     esp_wifi_stop();
 
-    // Deep sleep for 15 minutes
-    esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_MINUTES * 60 * 1000000ULL);
+    // Deep sleep
+    esp_sleep_enable_timer_wakeup((uint64_t)sleep_minutes * 60 * 1000000ULL);
     esp_deep_sleep_start();
 }

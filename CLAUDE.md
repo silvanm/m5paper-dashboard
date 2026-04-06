@@ -1,6 +1,6 @@
-# M5Paper Home Dashboard
+# Wardrobe Display
 
-E-ink dashboard for M5Paper S3 showing weather, temperature chart, and bus departures.
+E-ink wardrobe display for M5Paper S3 showing clothing recommendations, weather, temperature chart, and bus departures.
 
 ## Project Structure
 

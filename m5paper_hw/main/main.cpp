@@ -1,5 +1,5 @@
 /**
- * M5PaperS3 Home Dashboard
+ * Wardrobe Display — M5PaperS3
  *
  * Wakes from deep sleep, connects to WiFi, fetches dashboard JSON from backend,
  * renders the full dashboard on the e-ink display, then goes back to deep sleep.
@@ -59,6 +59,22 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     }
 }
 
+static bool wifi_try_connect(const char *ssid, const char *pass) {
+    s_retry_count = 0;
+    xEventGroupClearBits(s_wifi_events, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+
+    wifi_config_t wc = {};
+    strncpy((char*)wc.sta.ssid, ssid, sizeof(wc.sta.ssid));
+    strncpy((char*)wc.sta.password, pass, sizeof(wc.sta.password));
+    esp_wifi_set_config(WIFI_IF_STA, &wc);
+    esp_wifi_connect();
+
+    printf("Trying WiFi: %s\n", ssid);
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_events,
+        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(10000));
+    return (bits & WIFI_CONNECTED_BIT) != 0;
+}
+
 static bool wifi_connect() {
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -76,16 +92,13 @@ static bool wifi_connect() {
     esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &h1);
     esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &h2);
 
-    wifi_config_t wc = {};
-    strncpy((char*)wc.sta.ssid, WIFI_SSID, sizeof(wc.sta.ssid));
-    strncpy((char*)wc.sta.password, WIFI_PASS, sizeof(wc.sta.password));
     esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_set_config(WIFI_IF_STA, &wc);
     esp_wifi_start();
 
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_events,
-        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(15000));
-    return (bits & WIFI_CONNECTED_BIT) != 0;
+    // Try each configured network
+    if (wifi_try_connect(WIFI_SSID, WIFI_PASS)) return true;
+    if (wifi_try_connect(WIFI_SSID2, WIFI_PASS2)) return true;
+    return false;
 }
 
 // ---- HTTP fetch ----
@@ -272,13 +285,13 @@ static void render_dashboard(cJSON *data) {
     d.setTextColor(bg);
     d.setFont(&fonts::FreeSansBold12pt7b);
     d.setTextDatum(top_left);
-    d.drawString("HOME DASHBOARD", 16, 16);
+    d.drawString("WARDROBE DISPLAY", 16, 16);
 
     d.setFont(&fonts::FreeSans9pt7b);
     snprintf(buf, sizeof(buf), "Stand: %s", ts);
-    d.drawString(buf, 260, 8);
+    d.drawString(buf, 280, 8);
     snprintf(buf, sizeof(buf), "Nachstes Update ~%s", nu);
-    d.drawString(buf, 260, 26);
+    d.drawString(buf, 280, 26);
 
     // Battery icon (top right)
     int bat_pct = M5.Power.getBatteryLevel();
@@ -342,32 +355,28 @@ static void render_dashboard(cJSON *data) {
     d.setTextDatum(top_left);
     snprintf(buf, sizeof(buf), "%.0f / %.0f   Regen bis %.1f mm",
         tmin_j ? tmin_j->valuedouble : 0, tmax_j ? tmax_j->valuedouble : 0, rain_max_mm);
-    d.drawString(buf, tx + temp_w, ly + 52);
+    d.drawString(buf, tx, ly + 52);
 
     // ====== CLOTHING SECTION ======
     int cloth_y = ly + 85;
 
-    // 3x2 grid of clothing items
+    // 3x2 grid of clothing items (compact vertical spacing)
     cJSON *clothing = cJSON_GetObjectItem(data, "clothing");
-    int grid_cols = 3, grid_rows = 2;
-    int cell_w = 165, cell_h = 180;
+    int grid_cols = 3;
+    int cell_w = 165, cell_h = 164;  // reduced from 180
 
     for (int i = 0; i < cJSON_GetArraySize(clothing) && i < 6; i++) {
         cJSON *item = cJSON_GetArrayItem(clothing, i);
-        const char *category = cJSON_GetObjectItem(item, "category")->valuestring;
         const char *sprite_name = cJSON_GetObjectItem(item, "sprite")->valuestring;
-        const char *label = cJSON_GetObjectItem(item, "label")->valuestring;
 
         int col = i % grid_cols;
         int row = i / grid_cols;
         int cx = lx + col * cell_w;
         int cy = cloth_y + row * cell_h;
 
-        (void)category;  // category label not displayed
-
         // Sprite background box
         int box_x = cx + (cell_w - SPRITE_W) / 2;
-        int box_y = cy + 20;
+        int box_y = cy + 4;
         d.fillRect(box_x - 4, box_y - 4, SPRITE_W + 8, SPRITE_H + 8, faint);
 
         // Draw sprite
@@ -376,8 +385,17 @@ static void render_dashboard(cJSON *data) {
             drawSprite2bit(box_x, box_y, SPRITE_W, SPRITE_H, spr,
                 M5.Display.color565(255, 255, 255));  // white bg
         }
+    }
 
-        (void)label;  // label not displayed
+    // Clothing tip from GPT (below sprites)
+    cJSON *tip_j = cJSON_GetObjectItem(data, "clothing_tip");
+    if (tip_j && tip_j->valuestring && strlen(tip_j->valuestring) > 0) {
+        char tip[128];
+        sanitize_utf8(tip, tip_j->valuestring, sizeof(tip));
+        d.setFont(&fonts::FreeSans9pt7b);
+        d.setTextColor(dark);
+        d.setTextDatum(top_left);
+        d.drawString(tip, lx, cloth_y + 2 * cell_h + 8);
     }
 
     // ====== RIGHT COLUMN ======

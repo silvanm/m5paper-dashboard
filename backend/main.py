@@ -1,4 +1,4 @@
-"""Dashboard backend for M5PaperS3 home dashboard.
+"""Backend for Wardrobe Display.
 
 Fetches data from:
 - Netatmo: indoor/outdoor temp, humidity, CO2 (OAuth tokens from Firestore)
@@ -13,16 +13,20 @@ from zoneinfo import ZoneInfo
 
 LOCAL_TZ = ZoneInfo("Europe/Zurich")
 
+import json
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from pydantic import BaseModel
+from openai import OpenAI
+from langfuse import Langfuse
+from langfuse.openai import openai as langfuse_openai
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-app = FastAPI(title="M5Paper Dashboard API")
+app = FastAPI(title="Wardrobe Display API")
 
 # Config
 KACHELMANN_API_KEY = os.getenv("KACHELMANN_API_KEY")
@@ -71,6 +75,7 @@ class DashboardData(BaseModel):
     current_hour: int
     hour_labels: list[int]
     clothing: list[ClothingItem]
+    clothing_tip: str
     bus_stop_name: str
     bus_departures: list[BusDeparture]
     bus_departures_compact: list[CompactBusDeparture]
@@ -250,65 +255,124 @@ def _symbol_to_text_de(symbol: str) -> str:
     return mapping.get(symbol.lower(), symbol.capitalize() if symbol else "Keine Daten")
 
 
-# --- Clothing Recommendations ---
+# --- Clothing Recommendations (GPT-5.4 via Langfuse) ---
+
+AVAILABLE_SPRITES = {
+    "KOPF": [
+        {"sprite": "cap", "label": "Mütze"},
+        {"sprite": "nocap", "label": "Ohne"},
+    ],
+    "OBERTEIL": [
+        {"sprite": "raincoat", "label": "Regenjacke"},
+        {"sprite": "longsleeves", "label": "Langarm"},
+        {"sprite": "shortsleeves", "label": "Kurzarm"},
+    ],
+    "HOSE": [
+        {"sprite": "rainpants", "label": "Regenhose"},
+        {"sprite": "pants", "label": "Lange Hose"},
+        {"sprite": "shorts", "label": "Shorts"},
+    ],
+    "HAENDE": [
+        {"sprite": "mittens", "label": "Fäustlinge"},
+        {"sprite": "gloves", "label": "Handschuhe"},
+        {"sprite": "nogloves", "label": "Ohne"},
+    ],
+    "SCHUHE": [
+        {"sprite": "wintershoes", "label": "Winterschuhe"},
+        {"sprite": "sneakers", "label": "Sneakers"},
+    ],
+}
+
+_langfuse_client = None
+
+
+def _get_langfuse():
+    global _langfuse_client
+    if _langfuse_client is None:
+        _langfuse_client = Langfuse()
+    return _langfuse_client
+
+
+def _fallback_clothing() -> tuple[list[ClothingItem], str]:
+    """Safe fallback if LLM call fails."""
+    return [
+        ClothingItem(category="KOPF", sprite="nocap", label="Ohne"),
+        ClothingItem(category="OBERTEIL", sprite="longsleeves", label="Langarm"),
+        ClothingItem(category="HOSE", sprite="pants", label="Lange Hose"),
+        ClothingItem(category="HAENDE", sprite="nogloves", label="Ohne"),
+        ClothingItem(category="SCHUHE", sprite="sneakers", label="Sneakers"),
+    ], ""
 
 
 def recommend_clothing(
-    temps_remaining: list[float],
-    rain_remaining: list[float],
+    temps_24h: list[float],
+    rain_24h: list[float],
     wind_kmh: int | None,
-) -> list[ClothingItem]:
-    """Determine clothing based on remaining-day forecast (temps, rain mm, wind)."""
-    if not temps_remaining or all(t == 0 for t in temps_remaining):
-        t_min = 10.0
-    else:
-        t_min = min(temps_remaining)
+    current_hour: int,
+    weekday_name: str,
+) -> tuple[list[ClothingItem], str]:
+    """Use GPT-5.4 to recommend clothing based on weather forecast. Returns (items, tip)."""
+    try:
+        langfuse = _get_langfuse()
+        prompt = langfuse.get_prompt("clothing-recommendation")
+        system_msg = prompt.compile()
 
-    max_rain_mm = max(rain_remaining) if rain_remaining else 0
-    total_rain_mm = sum(rain_remaining) if rain_remaining else 0
-    wind = wind_kmh or 0
-    # Wind chill approximation: feels colder with wind
-    feels_like = t_min - (wind * 0.1)
+        # Build hourly forecast with absolute timestamps
+        hourly_forecast = []
+        for i, (t, r) in enumerate(zip(temps_24h, rain_24h)):
+            h = (current_hour + i) % 24
+            day = "Heute" if (current_hour + i) < 24 else "Morgen"
+            hourly_forecast.append(f"{day} {h:02d}h: {t}°C, {r}mm Regen")
 
-    items = []
+        weather_context = json.dumps({
+            "weekday": weekday_name,
+            "current_hour": f"{current_hour:02d}:00",
+            "hourly_forecast": hourly_forecast,
+            "wind_kmh": wind_kmh or 0,
+            "available_categories_and_sprites": AVAILABLE_SPRITES,
+        }, ensure_ascii=False)
 
-    # KOPF
-    if feels_like < 5:
-        items.append(ClothingItem(category="KOPF", sprite="cap", label="Mütze"))
-    else:
-        items.append(ClothingItem(category="KOPF", sprite="nocap", label="Ohne"))
+        response = langfuse_openai.responses.create(
+            model="gpt-5.4",
+            instructions=system_msg,
+            input=weather_context,
+            langfuse_prompt=prompt,
+        )
 
-    # OBERTEIL — rain >= 1mm/h or total >= 3mm means rain jacket
-    if max_rain_mm >= 1.0 or total_rain_mm >= 3.0:
-        items.append(ClothingItem(category="OBERTEIL", sprite="raincoat", label="Regenjacke"))
-    elif feels_like < 15:
-        items.append(ClothingItem(category="OBERTEIL", sprite="longsleeves", label="Langarm"))
-    else:
-        items.append(ClothingItem(category="OBERTEIL", sprite="shortsleeves", label="Kurzarm"))
+        result_text = response.output_text
+        parsed = json.loads(result_text)
 
-    # HOSE — heavy rain: rain pants
-    if max_rain_mm >= 3.0 or total_rain_mm >= 8.0:
-        items.append(ClothingItem(category="HOSE", sprite="rainpants", label="Regenhose"))
-    elif feels_like < 15:
-        items.append(ClothingItem(category="HOSE", sprite="pants", label="Lange Hose"))
-    else:
-        items.append(ClothingItem(category="HOSE", sprite="shorts", label="Shorts"))
+        # Support both formats: list (old) or {"items": [...], "tip": "..."} (new)
+        if isinstance(parsed, list):
+            items_data = parsed
+            tip = ""
+        else:
+            items_data = parsed.get("items", [])
+            tip = parsed.get("tip", "")[:100]
 
-    # HÄNDE
-    if feels_like < 3:
-        items.append(ClothingItem(category="HAENDE", sprite="mittens", label="Fäustlinge"))
-    elif feels_like < 8:
-        items.append(ClothingItem(category="HAENDE", sprite="gloves", label="Handschuhe"))
-    else:
-        items.append(ClothingItem(category="HAENDE", sprite="nogloves", label="Ohne"))
+        items = []
+        for item in items_data:
+            cat = item["category"]
+            sprite = item["sprite"]
+            valid_sprites = [s["sprite"] for s in AVAILABLE_SPRITES.get(cat, [])]
+            if sprite not in valid_sprites:
+                log.warning("GPT returned invalid sprite %s for %s, skipping", sprite, cat)
+                continue
+            label = next(
+                (s["label"] for s in AVAILABLE_SPRITES[cat] if s["sprite"] == sprite),
+                sprite
+            )
+            items.append(ClothingItem(category=cat, sprite=sprite, label=label))
 
-    # SCHUHE
-    if feels_like < 5 or max_rain_mm >= 3.0:
-        items.append(ClothingItem(category="SCHUHE", sprite="wintershoes", label="Winterschuhe"))
-    else:
-        items.append(ClothingItem(category="SCHUHE", sprite="sneakers", label="Sneakers"))
+        if len(items) < 3:
+            log.warning("GPT returned too few items (%d), using fallback", len(items))
+            return _fallback_clothing()
 
-    return items
+        return items, tip
+
+    except Exception as e:
+        log.error("Clothing LLM error: %s", e)
+        return _fallback_clothing()
 
 
 # --- ZVV Bus Departures ---
@@ -494,7 +558,11 @@ async def get_dashboard():
     rain_remaining = rain_24h[:hours_until_midnight]
     max_rain = max(rain_remaining) if rain_remaining else 0
 
-    clothing = recommend_clothing(temps_remaining, rain_remaining, weather.get("wind_kmh"))
+    weekday_names = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+    clothing, clothing_tip = recommend_clothing(
+        temps_24h, rain_24h, weather.get("wind_kmh"),
+        now.hour, weekday_names[now.weekday()]
+    )
 
     # Build compact departures for low-refresh mode
     bus_departures_compact = format_compact_departures(bus_deps) if refresh_mode == "low" else []
@@ -517,6 +585,7 @@ async def get_dashboard():
         current_hour=now.hour,
         hour_labels=hour_labels,
         clothing=clothing,
+        clothing_tip=clothing_tip,
         bus_stop_name=BUS_STOP_NAME,
         bus_departures=[BusDeparture(**d) for d in bus_deps],
         bus_departures_compact=bus_departures_compact,

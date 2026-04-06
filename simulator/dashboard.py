@@ -56,7 +56,7 @@ def draw_dashboard(screen: pygame.Surface, data: dict, fonts: dict, icons: dict)
 
     # ====== HEADER ======
     pygame.draw.rect(screen, BLACK, (0, 0, SCREEN_W, 56))
-    f_title.render_to(screen, (20, 15), "HOME DASHBOARD", BG)
+    f_title.render_to(screen, (20, 15), "WARDROBE DISPLAY", BG)
     ts_text = f"Stand: {data['timestamp']}  ·  Nächstes Update ~{data['next_update']}"
     f_sm.render_to(screen, (260, 22), ts_text, BG)
 

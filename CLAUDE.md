@@ -1,6 +1,6 @@
-# Wardrobe Display
+# Weather & Departures Display
 
-E-ink wardrobe display for M5Paper S3 showing clothing recommendations, weather, temperature chart, and bus departures.
+E-ink display for M5Paper S3 showing weather forecast (3 period icons, stats, 24h chart) and bus departures.
 
 ## Project Structure
 
@@ -32,4 +32,4 @@ task clean          # clean build
 ```
 
 ---
-Updated: 2026-04-04
+Updated: 2026-04-10

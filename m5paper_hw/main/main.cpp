@@ -20,7 +20,6 @@
 #include "freertos/event_groups.h"
 #include "cJSON.h"
 #include "weather_icons_2bit.h"
-#include "clothing_sprites.h"
 
 // ---- Configuration ----
 // WiFi and API credentials — create secrets.h from secrets.h.example
@@ -230,7 +229,7 @@ static void drawSprite2bit(int x, int y, int w, int h, const uint8_t *data, uint
         lut[2] = M5.Display.color565(176, 176, 176);
         lut_init = true;
     }
-    uint16_t row_buf[SPRITE_W];
+    uint16_t row_buf[WEATHER_ICON_W];
 
     for (int row = 0; row < h; row++) {
         for (int col = 0; col < w; col++) {
@@ -244,22 +243,13 @@ static void drawSprite2bit(int x, int y, int w, int h, const uint8_t *data, uint
     }
 }
 
-// Lookup sprite data by name from JSON
-static const uint8_t* lookup_sprite(const char *name) {
-    struct { const char *name; const uint8_t *data; } map[] = {
-        {"cap", sprite_cap}, {"nocap", sprite_nocap},
-        {"shortsleeves", sprite_shortsleeves}, {"longsleeves", sprite_longsleeves},
-        {"raincoat", sprite_raincoat},
-        {"shorts", sprite_shorts}, {"pants", sprite_pants},
-        {"rainpants", sprite_rainpants},
-        {"gloves", sprite_gloves}, {"mittens", sprite_mittens},
-        {"nogloves", sprite_nogloves},
-        {"sneakers", sprite_sneakers}, {"wintershoes", sprite_wintershoes},
-    };
-    for (auto &e : map) {
-        if (strcmp(name, e.name) == 0) return e.data;
-    }
-    return nullptr;
+// Map weather condition string to icon data
+static const uint8_t* condition_to_icon(const char *cond) {
+    if (strcmp(cond, "sunny") == 0) return weather_sunny;
+    if (strcmp(cond, "cloudy") == 0) return weather_cloudy;
+    if (strcmp(cond, "rainy") == 0) return weather_rainy;
+    if (strcmp(cond, "snowy") == 0) return weather_snowy;
+    return weather_partly_cloudy;  // default
 }
 
 // ---- Dashboard rendering ----
@@ -281,21 +271,21 @@ static void render_dashboard(cJSON *data) {
     const char *nu = cJSON_GetObjectItem(data, "next_update")->valuestring;
 
     // ====== HEADER ======
-    d.fillRect(0, 0, SCREEN_W, 48, black);
+    d.fillRect(0, 0, SCREEN_W, 44, black);
     d.setTextColor(bg);
     d.setFont(&fonts::FreeSansBold12pt7b);
     d.setTextDatum(top_left);
-    d.drawString("WARDROBE DISPLAY", 16, 16);
+    d.drawString("WETTER & ABFAHRTEN", 16, 12);
 
+    int bat_y = 12;
     d.setFont(&fonts::FreeSans9pt7b);
-    snprintf(buf, sizeof(buf), "Stand: %s", ts);
-    d.drawString(buf, 280, 8);
-    snprintf(buf, sizeof(buf), "Nachstes Update ~%s", nu);
-    d.drawString(buf, 280, 26);
+    snprintf(buf, sizeof(buf), "%s  |  Update ~%s", ts, nu);
+    d.setTextDatum(top_right);
+    d.drawString(buf, SCREEN_W - 135, bat_y  );
 
     // Battery icon (top right)
     int bat_pct = M5.Power.getBatteryLevel();
-    int bat_x = SCREEN_W - 70, bat_y = 14;
+    int bat_x = SCREEN_W - 70;
     d.drawRect(bat_x, bat_y, 40, 18, bg);
     d.fillRect(bat_x + 40, bat_y + 5, 4, 8, bg);
     int fill_w = (36 * bat_pct) / 100;
@@ -305,112 +295,133 @@ static void render_dashboard(cJSON *data) {
     d.setFont(&fonts::FreeSans9pt7b);
     d.drawString(buf, bat_x - 4, bat_y);
 
-    // ====== LEFT COLUMN (weather + clothing) ======
-    int lx = 16, ly = 60;
-    int col_split = 530;  // left column width
+    // ====== LEFT COLUMN (weather + chart) ======
+    int lx = 16;
+    int col_split = 510;
+    int ly = 54;
+    uint16_t white_bg = M5.Display.color565(255, 255, 255);
 
-    // Weather icon (left)
-    const char *cond = cJSON_GetObjectItem(data, "weather_condition")->valuestring;
-    const uint8_t *icon_data = weather_partly_cloudy;
-    if (strcmp(cond, "sunny") == 0) icon_data = weather_sunny;
-    else if (strcmp(cond, "cloudy") == 0) icon_data = weather_cloudy;
-    else if (strcmp(cond, "rainy") == 0) icon_data = weather_rainy;
-    else if (strcmp(cond, "snowy") == 0) icon_data = weather_snowy;
-    drawSprite2bit(lx, ly - 5, WEATHER_ICON_W, WEATHER_ICON_H, icon_data,
-        M5.Display.color565(255, 255, 255));  // white bg
+    // -- Row 1: Actual temp (left) + 3 period icons (right) --
+    d.setFont(&fonts::FreeSans9pt7b);
+    d.setTextColor(mid);
+    d.setTextDatum(top_left);
+    d.drawString("AKTUELL", lx + 8, ly + 2);
 
-    // Temperature (right of icon)
-    int tx = lx + WEATHER_ICON_W + 12;
     cJSON *to_j = cJSON_GetObjectItem(data, "temp_outdoor");
     d.setFont(&fonts::FreeSansBold24pt7b);
+    d.setTextSize(2);
+    d.setTextColor(black);
     d.setTextDatum(top_left);
-    int temp_w = 0;
     if (to_j && !cJSON_IsNull(to_j)) {
         snprintf(buf, sizeof(buf), "%.0f", to_j->valuedouble);
-        drawTemp(tx, ly, buf, black, 6);
-        temp_w = d.textWidth(buf) + 20;
+        drawTemp(lx + 4, ly + 30, buf, black, 10);
     } else {
-        drawTemp(tx, ly, "--", black, 6);
-        temp_w = d.textWidth("--") + 20;
+        drawTemp(lx + 4, ly + 30, "--", black, 10);
+    }
+    d.setTextSize(1);
+
+    // 3 period weather icons
+    cJSON *periods = cJSON_GetObjectItem(data, "weather_periods");
+    int icon_start_x = 195;
+    int icon_col_w = 106;
+    int n_periods = periods ? cJSON_GetArraySize(periods) : 0;
+    printf("weather_periods: %d entries\n", n_periods);
+
+    for (int i = 0; i < n_periods && i < 3; i++) {
+        cJSON *period = cJSON_GetArrayItem(periods, i);
+        cJSON *pcond_j = cJSON_GetObjectItem(period, "condition");
+        cJSON *plabel_j = cJSON_GetObjectItem(period, "label");
+        if (!pcond_j || !plabel_j) continue;
+
+        const char *pcond = pcond_j->valuestring;
+        const char *plabel = plabel_j->valuestring;
+        printf("  period %d: %s = %s\n", i, plabel, pcond);
+
+        int cx = icon_start_x + i * icon_col_w;
+
+        // Draw weather icon directly (no box)
+        const uint8_t *icon = condition_to_icon(pcond);
+        drawSprite2bit(cx, ly, WEATHER_ICON_W, WEATHER_ICON_H, icon, white_bg);
+
+        // Period label — centered below icon
+        char lbl[32];
+        sanitize_utf8(lbl, plabel, sizeof(lbl));
+        d.setFont(&fonts::FreeSans9pt7b);
+        d.setTextColor(dark);
+        d.setTextDatum(top_center);
+        d.drawString(lbl, cx + WEATHER_ICON_W / 2, ly + WEATHER_ICON_H);
     }
 
-    // Wind (right of temperature)
-    cJSON *wind_j = cJSON_GetObjectItem(data, "wind_kmh");
-    cJSON *wdir_j = cJSON_GetObjectItem(data, "wind_dir");
-    d.setFont(&fonts::FreeSansBold9pt7b);
-    d.setTextColor(dark);
-    d.setTextDatum(top_left);
-    snprintf(buf, sizeof(buf), "%d km/h %s",
-        wind_j ? wind_j->valueint : 0,
-        (wdir_j && !cJSON_IsNull(wdir_j)) ? wdir_j->valuestring : "");
-    d.drawString(buf, tx + temp_w, ly + 20);
+    ly += WEATHER_ICON_H + 24;
 
-    // Min/Max + Rain (below temperature)
+    // -- Row 2: Stats — max/min + rain/wind/gusts/precip --
+    d.drawLine(lx, ly, col_split - 10, ly, light);
+    ly += 6;
+
+    // Left: max / min temps
     cJSON *tmin_j = cJSON_GetObjectItem(data, "temp_min");
     cJSON *tmax_j = cJSON_GetObjectItem(data, "temp_max");
-    float rain_max_mm = cJSON_GetObjectItem(data, "rain_max_mm")->valuedouble;
 
     d.setFont(&fonts::FreeSans9pt7b);
     d.setTextColor(mid);
     d.setTextDatum(top_left);
-    snprintf(buf, sizeof(buf), "%.0f / %.0f   Regen bis %.1f mm",
-        tmin_j ? tmin_j->valuedouble : 0, tmax_j ? tmax_j->valuedouble : 0, rain_max_mm);
-    d.drawString(buf, tx, ly + 52);
-
-    // ====== CLOTHING SECTION ======
-    int cloth_y = ly + 85;
-
-    // 3x2 grid of clothing items (compact vertical spacing)
-    cJSON *clothing = cJSON_GetObjectItem(data, "clothing");
-    int grid_cols = 3;
-    int cell_w = 165, cell_h = 164;  // reduced from 180
-
-    for (int i = 0; i < cJSON_GetArraySize(clothing) && i < 6; i++) {
-        cJSON *item = cJSON_GetArrayItem(clothing, i);
-        const char *sprite_name = cJSON_GetObjectItem(item, "sprite")->valuestring;
-
-        int col = i % grid_cols;
-        int row = i / grid_cols;
-        int cx = lx + col * cell_w;
-        int cy = cloth_y + row * cell_h;
-
-        // Sprite background box
-        int box_x = cx + (cell_w - SPRITE_W) / 2;
-        int box_y = cy + 4;
-        d.fillRect(box_x - 4, box_y - 4, SPRITE_W + 8, SPRITE_H + 8, faint);
-
-        // Draw sprite
-        const uint8_t *spr = lookup_sprite(sprite_name);
-        if (spr) {
-            drawSprite2bit(box_x, box_y, SPRITE_W, SPRITE_H, spr,
-                M5.Display.color565(255, 255, 255));  // white bg
-        }
+    d.drawString("max", lx + 8, ly + 26);
+    d.setFont(&fonts::FreeSansBold18pt7b);
+    d.setTextColor(black);
+    if (tmax_j && !cJSON_IsNull(tmax_j)) {
+        snprintf(buf, sizeof(buf), "%.0f", tmax_j->valuedouble);
+        drawTemp(lx + 50, ly + 20, buf, black, 4);
     }
 
-    // Clothing tip from GPT (below sprites)
-    cJSON *tip_j = cJSON_GetObjectItem(data, "clothing_tip");
-    if (tip_j && tip_j->valuestring && strlen(tip_j->valuestring) > 0) {
-        char tip[128];
-        sanitize_utf8(tip, tip_j->valuestring, sizeof(tip));
-        d.setFont(&fonts::FreeSans9pt7b);
-        d.setTextColor(dark);
-        d.setTextDatum(top_left);
-        d.drawString(tip, lx, cloth_y + 2 * cell_h + 8);
+    d.setFont(&fonts::FreeSans9pt7b);
+    d.setTextColor(mid);
+    d.drawString("min", lx + 8, ly + 64);
+    d.setFont(&fonts::FreeSansBold18pt7b);
+    d.setTextColor(black);
+    if (tmin_j && !cJSON_IsNull(tmin_j)) {
+        snprintf(buf, sizeof(buf), "%.0f", tmin_j->valuedouble);
+        drawTemp(lx + 50, ly + 58, buf, black, 4);
     }
 
-    // ====== RIGHT COLUMN ======
-    int rx = col_split + 10;
-    int rw = SCREEN_W - rx - 10;
+    // Right: rain%, wind, gusts, precipitation
+    int rc_x = 230;
+    int row_h = 20;
 
-    // ====== CHART ======
-    int chart_x = rx + 30, chart_y = ly + 20;
-    int chart_w = rw - 80, chart_h = 160;
-    int chart_b = chart_y + chart_h;
+    cJSON *rain_prob_j = cJSON_GetObjectItem(data, "rain_probability_pct");
+    cJSON *wind_j = cJSON_GetObjectItem(data, "wind_kmh");
+    cJSON *gust_j = cJSON_GetObjectItem(data, "wind_gust_kmh");
+    cJSON *precip_j = cJSON_GetObjectItem(data, "precip_total_mm");
+
+    d.setFont(&fonts::FreeSansBold12pt7b);
+    d.setTextColor(black);
+    d.setTextDatum(top_left);
+    snprintf(buf, sizeof(buf), "Regen  %d%%", rain_prob_j ? rain_prob_j->valueint : 0);
+    d.drawString(buf, rc_x, ly);
+
+    d.setFont(&fonts::FreeSans9pt7b);
+    d.setTextColor(dark);
+    snprintf(buf, sizeof(buf), "Niederschlag  %.1f mm", precip_j ? precip_j->valuedouble : 0.0);
+    d.drawString(buf, rc_x, ly + (row_h + 8) * 3);
+    snprintf(buf, sizeof(buf), "Wind  %d km/h", wind_j ? wind_j->valueint : 0);
+    d.drawString(buf, rc_x, ly + row_h + 8);
+    snprintf(buf, sizeof(buf), "Boen  %d km/h", gust_j ? gust_j->valueint : 0);
+    d.drawString(buf, rc_x, ly + (row_h + 8) * 2);
+    
+    ly += 106;
+
+    // -- Row 3: 24h Temperature & Rain chart --
+    d.drawLine(lx, ly, col_split - 10, ly, light);
+    ly += 10;
 
     d.setTextColor(black);
     d.setFont(&fonts::FreeSansBold9pt7b);
     d.setTextDatum(top_left);
-    
+    d.drawString("TEMPERATUR & REGEN - 24h", lx + 4, ly);
+    ly += 24;
+
+    int chart_x = lx + 34, chart_w = col_split - lx - 100;
+    int chart_h = 160, chart_b = ly + chart_h;
+
     cJSON *temps_arr = cJSON_GetObjectItem(data, "temp_outdoor_24h");
     cJSON *rain_arr = cJSON_GetObjectItem(data, "rain_mm_24h");
     cJSON *hours_arr = cJSON_GetObjectItem(data, "hour_labels");
@@ -436,38 +447,39 @@ static void render_dashboard(cJSON *data) {
     if (c_range < 1) c_range = 1;
 
     // Y-axis labels + grid
+    d.setTextColor(mid);
     d.setTextDatum(middle_right);
     for (int t = (int)c_min; t <= (int)c_max; t += 5) {
         int y = chart_b - (int)(((t - c_min) / c_range) * chart_h);
         snprintf(buf, sizeof(buf), "%d", t);
-        d.drawString(buf, chart_x - 6, y);
+        d.drawString(buf, chart_x - 4, y);
         d.drawLine(chart_x, y, chart_x + chart_w, y, faint);
     }
 
-    // Rain mm Y-axis (right) — scale 0-10mm
-    float rain_scale = 10.0f;  // max mm for full chart height
+    // Rain mm Y-axis (right)
+    float rain_scale = 10.0f;
     d.setTextColor(light);
     d.setTextDatum(middle_left);
-    for (int mm = 0; mm <= 10; mm += 2) {
+    for (int mm = 0; mm <= 10; mm += 5) {
         int y = chart_b - (mm * chart_h) / (int)rain_scale;
         snprintf(buf, sizeof(buf), "%dmm", mm);
-        d.drawString(buf, chart_x + chart_w + 6, y);
+        d.drawString(buf, chart_x + chart_w + 4, y);
     }
 
     // X-axis labels
     d.setTextColor(mid);
     d.setTextDatum(top_center);
-    for (int i = 0; i < 24; i += 2) {
+    for (int i = 0; i < 24; i += 4) {
         int x = chart_x + (i * chart_w) / 23;
         snprintf(buf, sizeof(buf), "%02d", hours[i]);
-        d.drawString(buf, x, chart_b + 4);
+        d.drawString(buf, x, chart_b + 7);
     }
 
     // Vertical markers at midnight (00) and noon (12)
     for (int i = 0; i < 24; i++) {
         if (hours[i] == 0 || hours[i] == 12) {
             int x = chart_x + (i * chart_w) / 23;
-            drawDashedLineV(x, chart_y, chart_b, light, 3, 3);
+            drawDashedLineV(x, ly, chart_b, light, 3, 3);
         }
     }
 
@@ -477,12 +489,12 @@ static void render_dashboard(cJSON *data) {
     for (int i = 0; i < 24; i++) {
         if (rain[i] > 0.05f) {
             int x = chart_x + (i * chart_w) / 23 - bar_w / 2;
-            int bar_h = (int)(rain[i] / rain_scale * chart_h);
-            if (bar_h > chart_h) bar_h = chart_h;
-            if (bar_h < 2) bar_h = 2;
-            int y = chart_b - bar_h;
+            int bh = (int)(rain[i] / rain_scale * chart_h);
+            if (bh > chart_h) bh = chart_h;
+            if (bh < 2) bh = 2;
+            int y = chart_b - bh;
             uint32_t color = rain[i] > 5.0f ? dark : (rain[i] > 1.0f ? mid : light);
-            d.fillRect(x, y, bar_w, bar_h, color);
+            d.fillRect(x, y, bar_w, bh, color);
         }
     }
 
@@ -501,22 +513,18 @@ static void render_dashboard(cJSON *data) {
 
     // Dot at first data point (now)
     int dot_y = chart_b - (int)(((temps[0] - c_min) / c_range) * chart_h);
-    d.fillCircle(chart_x, dot_y, 5, black);
-    d.fillCircle(chart_x, dot_y, 2, bg);
+    d.fillCircle(chart_x, dot_y, 4, black);
+    d.fillCircle(chart_x, dot_y, 1, bg);
 
-    // Legend
-    int leg_y = chart_b + 30;
-    d.drawLine(chart_x, leg_y, chart_x + 20, leg_y, black);
-    d.drawLine(chart_x, leg_y - 1, chart_x + 20, leg_y - 1, black);
-    d.setTextColor(dark);
-    d.setTextDatum(top_left);
-    d.setFont(&fonts::FreeSans9pt7b);
-    d.drawString("Temp", chart_x + 26, leg_y - 7);
-    d.fillRect(chart_x + 80, leg_y - 6, 14, 12, mid);
-    d.drawString("Regen mm", chart_x + 100, leg_y - 7);
+    // ====== RIGHT COLUMN (bus departures) ======
+    int rx = col_split + 10;
+    int rw = SCREEN_W - rx - 10;
+
+    // Vertical divider
+    d.drawLine(col_split, 54, col_split, SCREEN_H - 28, light);
 
     // ====== BUS DEPARTURES ======
-    int bus_y = chart_b + 44;
+    int bus_y = 54;
     int bus_w = rw;
 
     // Header bar
@@ -534,51 +542,80 @@ static void render_dashboard(cJSON *data) {
     const char *refresh_mode = cJSON_GetObjectItem(data, "refresh_mode")->valuestring;
 
     if (strcmp(refresh_mode, "low") == 0) {
-        // Compact mode: one line per destination with all times
+        // Compact mode: badge+dest top, times below with auto line wrap
         cJSON *compact = cJSON_GetObjectItem(data, "bus_departures_compact");
-        int entry_h = 26;
+        int times_max_w = bus_w - 20;  // available width for times
+        int ey = bus_y + 34;
 
         for (int i = 0; i < cJSON_GetArraySize(compact) && i < 8; i++) {
             cJSON *item = cJSON_GetArrayItem(compact, i);
-            int ey = bus_y + 34 + i * entry_h;
 
-            if (i % 2 == 0) d.fillRect(rx, ey, bus_w, entry_h - 1, faint);
+            // Build times into two lines with word wrap
+            cJSON *times_arr2 = cJSON_GetObjectItem(item, "times");
+            char line1[128] = {};
+            char line2[128] = {};
+            d.setFont(&fonts::FreeSansBold12pt7b);
 
-            // Line badge (smaller)
-            int badge_x = rx + 4, badge_y2 = ey + 2, badge_w2 = 30, badge_h2 = 20;
+            for (int t = 0; t < cJSON_GetArraySize(times_arr2); t++) {
+                const char *tval = cJSON_GetArrayItem(times_arr2, t)->valuestring;
+                // Try adding to line1
+                char test[256];
+                snprintf(test, sizeof(test), "%s%s%s", line1, strlen(line1) ? "  " : "", tval);
+                if (d.textWidth(test) <= times_max_w) {
+                    strncpy(line1, test, sizeof(line1) - 1);
+                } else {
+                    // Overflow to line2
+                    size_t len2 = strlen(line2);
+                    if (len2 > 0 && len2 < sizeof(line2) - 8) strcat(line2, "  ");
+                    strncat(line2, tval, sizeof(line2) - strlen(line2) - 1);
+                }
+            }
+
+            // Calculate entry height: header(28) + line1(22) + line2(22 if needed) + pad(6)
+            int entry_h = 28 + 27 + (strlen(line2) ? 27 : 0) + 6;
+
+            // Don't draw past screen
+            if (ey + entry_h > SCREEN_H - 30) break;
+
+            if (i % 2 == 0) d.fillRect(rx, ey, bus_w, entry_h - 2, faint);
+
+            // Line badge
+            int badge_x = rx + 8, badge_y2 = ey + 4, badge_w2 = 36, badge_h2 = 24;
             d.fillRect(badge_x, badge_y2, badge_w2, badge_h2, black);
             d.setTextColor(bg);
-            d.setFont(&fonts::FreeSans9pt7b);
+            d.setFont(&fonts::FreeSansBold9pt7b);
             d.setTextDatum(middle_center);
             d.drawString(cJSON_GetObjectItem(item, "line")->valuestring,
                          badge_x + badge_w2 / 2, badge_y2 + badge_h2 / 2);
 
-            // Destination (compact)
+            // Destination
             char dest[48];
             sanitize_utf8(dest, cJSON_GetObjectItem(item, "dest")->valuestring, sizeof(dest));
-            if (strlen(dest) > 14) { dest[14] = '\0'; strcat(dest, ".."); }
+            if (strlen(dest) > 20) { dest[20] = '\0'; strcat(dest, ".."); }
             d.setTextColor(black);
-            d.setFont(&fonts::FreeSans9pt7b);
+            d.setFont(&fonts::FreeSansBold9pt7b);
             d.setTextDatum(top_left);
-            d.drawString(dest, rx + 38, ey + 4);
+            d.drawString(dest, rx + 52, ey + 8);
 
-            // Times (comma-separated)
-            cJSON *times_arr = cJSON_GetObjectItem(item, "times");
-            char times_buf[128] = {};
-            for (int t = 0; t < cJSON_GetArraySize(times_arr); t++) {
-                if (t > 0) strcat(times_buf, ", ");
-                strcat(times_buf, cJSON_GetArrayItem(times_arr, t)->valuestring);
-            }
+            // Times line 1
             d.setTextColor(dark);
-            d.setTextDatum(top_right);
-            d.drawString(times_buf, rx + bus_w - 6, ey + 4);
+            d.setFont(&fonts::FreeSansBold12pt7b);
+            d.setTextDatum(top_left);
+            d.drawString(line1, rx + 7, ey + 33);
+
+            // Times line 2 (if overflow)
+            if (strlen(line2)) {
+                d.drawString(line2, rx + 7, ey + 55);
+            }
+
+            ey += entry_h;
         }
     } else {
         // Normal mode: one entry per departure
         cJSON *deps = cJSON_GetObjectItem(data, "bus_departures");
         int entry_h = 40;
 
-        for (int i = 0; i < cJSON_GetArraySize(deps) && i < 5; i++) {
+        for (int i = 0; i < cJSON_GetArraySize(deps) && i < 10; i++) {
             cJSON *dep = cJSON_GetArrayItem(deps, i);
             int ey = bus_y + 34 + i * entry_h;
 

@@ -1,8 +1,8 @@
-"""Backend for Wardrobe Display.
+"""Backend for Weather & Departures Display.
 
 Fetches data from:
-- Netatmo: indoor/outdoor temp, humidity, CO2 (OAuth tokens from Firestore)
-- Kachelmann: weather forecast with hourly data
+- Netatmo: indoor/outdoor temp, humidity, CO2 (via Kitchen Display backend)
+- Kachelmann: weather forecast (hourly + 3-day) with period conditions
 - transport.opendata.ch: ZVV bus departures
 """
 
@@ -13,26 +13,48 @@ from zoneinfo import ZoneInfo
 
 LOCAL_TZ = ZoneInfo("Europe/Zurich")
 
-import json
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from openai import OpenAI
-from langfuse import Langfuse
-from langfuse.openai import openai as langfuse_openai
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-app = FastAPI(title="Wardrobe Display API")
+app = FastAPI(title="Weather & Departures Display API")
+
+# IP allowlist
+ALLOWED_IPS = [ip.strip() for ip in os.getenv("ALLOWED_IPS", "").split(",") if ip.strip()]
+
+
+@app.middleware("http")
+async def ip_filter(request: Request, call_next):
+    if ALLOWED_IPS:
+        # Cloud Run: real client IP is in X-Forwarded-For (first entry)
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            client_ip = forwarded.split(",")[0].strip()
+        else:
+            client_ip = request.client.host if request.client else None
+        if client_ip not in ALLOWED_IPS:
+            log.warning("Blocked request from %s", client_ip)
+            return JSONResponse(status_code=403, content={"detail": "Forbidden"})
+    return await call_next(request)
+
 
 # Config
 KACHELMANN_API_KEY = os.getenv("KACHELMANN_API_KEY")
 WEATHER_LAT = os.getenv("WEATHER_LATITUDE", "47.382")
 WEATHER_LON = os.getenv("WEATHER_LONGITUDE", "8.482")
-BUS_STOP_NAME = os.getenv("BUS_STOP_NAME", "Zürich, Letzigrund")
+BUS_STOP_NAME = os.getenv("BUS_STOP_NAME", "Zürich, Rautistrasse")
+
+# Additional stops with line/direction filters
+EXTRA_STOPS = [
+    {"stop": "Zürich, Lindenplatz", "lines": {"2"}, "destinations": {"Zürich, Klusplatz"}},
+    {"stop": "Zürich, Fellenbergstrasse", "lines": {"3"}, "destinations": {"Zürich, Klusplatz"}},
+]
 
 
 # --- Models ---
@@ -51,10 +73,9 @@ class CompactBusDeparture(BaseModel):
     times: list[str]
 
 
-class ClothingItem(BaseModel):
-    category: str       # KOPF, OBERTEIL, HOSE, HAENDE, SCHUHE
-    sprite: str         # sprite filename without extension (e.g. "cap", "raincoat")
-    label: str          # display label (e.g. "Mütze", "Regenjacke")
+class WeatherPeriod(BaseModel):
+    label: str          # "vormittags", "nachmittags", "abends"
+    condition: str      # "sunny", "partly_cloudy", "cloudy", "rainy", "snowy"
 
 
 class DashboardData(BaseModel):
@@ -65,17 +86,18 @@ class DashboardData(BaseModel):
     temp_outdoor: float | None
     wind_kmh: int | None
     wind_dir: str | None
+    wind_gust_kmh: int | None
     temp_min: float | None
     temp_max: float | None
-    rain_max_mm: float
+    rain_probability_pct: int   # 0-100 from Kachelmann 3-day
+    precip_total_mm: float      # total precipitation mm
     weather_condition: str
     weather_text: str
+    weather_periods: list[WeatherPeriod]  # 3 periods: morning/afternoon/evening
     temp_outdoor_24h: list[float]
     rain_mm_24h: list[float]
     current_hour: int
     hour_labels: list[int]
-    clothing: list[ClothingItem]
-    clothing_tip: str
     bus_stop_name: str
     bus_departures: list[BusDeparture]
     bus_departures_compact: list[CompactBusDeparture]
@@ -118,24 +140,26 @@ async def fetch_netatmo() -> dict:
 # --- Weather (Kachelmann hourly + 3-day summary) ---
 
 
-async def fetch_weather() -> dict:
+async def fetch_weather_hourly() -> dict:
     """Fetch weather from Kachelmann hourly forecast (standard/1h)."""
     fallback = {
         "temp_min": None,
         "temp_max": None,
         "wind_kmh": None,
         "wind_dir": None,
+        "wind_gust_kmh": None,
         "weather_condition": "unknown",
         "weather_text": "Keine Daten",
+        "weather_periods": [],
         "temp_outdoor_24h": [0.0] * 24,
         "rain_24h": [0.0] * 24,
+        "precip_total_mm": 0.0,
     }
     if not KACHELMANN_API_KEY:
         return fallback
 
     headers = {"X-API-Key": KACHELMANN_API_KEY}
     now = datetime.now(LOCAL_TZ)
-    today_date = now.date()
 
     async with httpx.AsyncClient() as client:
         hourly_url = f"https://api.kachelmannwetter.com/v02/forecast/{WEATHER_LAT}/{WEATHER_LON}/standard/1h"
@@ -154,19 +178,34 @@ async def fetch_weather() -> dict:
         rain_next_24h = [0.0] * 24  # precipitation in mm (precCurrent)
         cur_wind_ms = None
         cur_wind_dir = None
+        max_wind_gust_ms = 0.0
         first_entry = None
+
+        # Per-period data for deriving conditions (keyed by hour 0-23)
+        hourly_cloud = {}  # hour -> cloudCoverage
+        hourly_rain = {}   # hour -> precCurrent
 
         for entry in entries:
             dt_str = entry.get("dateTime", "")
             try:
                 dt = datetime.fromisoformat(dt_str).astimezone(LOCAL_TZ)
-                # Offset in hours from current hour (0 = current hour, 1 = next, ...)
                 now_hour_start = now.replace(minute=0, second=0, microsecond=0)
                 delta_h = round((dt - now_hour_start).total_seconds() / 3600)
                 if delta_h < 0 or delta_h >= 24:
                     continue
                 temps_next_24h[delta_h] = round(entry.get("temp", 0), 1)
                 rain_next_24h[delta_h] = round(entry.get("precCurrent", 0) or 0, 1)
+
+                # Track wind gust
+                gust = entry.get("windGust", 0) or 0
+                if gust > max_wind_gust_ms:
+                    max_wind_gust_ms = gust
+
+                # Track per-hour cloud + rain for period derivation
+                hour = dt.hour
+                hourly_cloud[hour] = entry.get("cloudCoverage", 50)
+                hourly_rain[hour] = entry.get("precCurrent", 0) or 0
+
                 if first_entry is None:
                     first_entry = entry
             except (ValueError, KeyError):
@@ -177,7 +216,7 @@ async def fetch_weather() -> dict:
             temps_next_24h[0] = temps_next_24h[1]
             rain_next_24h[0] = rain_next_24h[1]
 
-        # Use first entry (closest to now) for wind and weather condition
+        # Current weather condition from first entry
         weather_condition = "unknown"
         weather_text = "Keine Daten"
         if first_entry:
@@ -189,8 +228,8 @@ async def fetch_weather() -> dict:
                 weather_condition = "rainy"
                 weather_text = "Regen"
             elif cloud < 25:
-                weather_condition = "clear"
-                weather_text = "Klar"
+                weather_condition = "sunny"
+                weather_text = "Sonnig"
             elif cloud < 75:
                 weather_condition = "partly_cloudy"
                 weather_text = "Teilweise bewölkt"
@@ -198,21 +237,115 @@ async def fetch_weather() -> dict:
                 weather_condition = "cloudy"
                 weather_text = "Bewölkt"
 
+        # Derive period conditions from hourly data (fallback if 3-day unavailable)
+        periods = _derive_periods_from_hourly(hourly_cloud, hourly_rain)
+
         active_temps = [t for t in temps_next_24h if t != 0]
         day_temp_min = min(active_temps) if active_temps else None
         day_temp_max = max(active_temps) if active_temps else None
-
         wind_kmh = int(cur_wind_ms * 3.6) if cur_wind_ms else None
+        wind_gust_kmh = int(max_wind_gust_ms * 3.6) if max_wind_gust_ms else None
+        precip_total = round(sum(rain_next_24h), 1)
 
         return {
             "temp_min": day_temp_min,
             "temp_max": day_temp_max,
             "wind_kmh": wind_kmh,
             "wind_dir": _deg_to_compass(cur_wind_dir),
+            "wind_gust_kmh": wind_gust_kmh,
             "weather_condition": weather_condition,
             "weather_text": weather_text,
+            "weather_periods": periods,
             "temps_next_24h": temps_next_24h,
             "rain_next_24h": rain_next_24h,
+            "precip_total_mm": precip_total,
+        }
+
+
+def _derive_periods_from_hourly(
+    hourly_cloud: dict[int, float], hourly_rain: dict[int, float]
+) -> list[dict]:
+    """Derive morning/afternoon/evening weather conditions from hourly data."""
+    period_ranges = [
+        ("vormittags", range(6, 12)),
+        ("nachmittags", range(12, 18)),
+        ("abends", range(18, 24)),
+    ]
+    periods = []
+    for label, hours in period_ranges:
+        clouds = [hourly_cloud[h] for h in hours if h in hourly_cloud]
+        rains = [hourly_rain[h] for h in hours if h in hourly_rain]
+        avg_cloud = sum(clouds) / len(clouds) if clouds else 50
+        max_rain = max(rains) if rains else 0
+        if max_rain > 0.1:
+            cond = "rainy"
+        elif avg_cloud < 25:
+            cond = "sunny"
+        elif avg_cloud < 75:
+            cond = "partly_cloudy"
+        else:
+            cond = "cloudy"
+        periods.append({"label": label, "condition": cond})
+    return periods
+
+
+async def fetch_weather_3day() -> dict:
+    """Fetch Kachelmann 3-day forecast for rain probability and period weather symbols."""
+    fallback = {"rain_probability_pct": 0, "periods": None}
+    if not KACHELMANN_API_KEY:
+        return fallback
+
+    headers = {"X-API-Key": KACHELMANN_API_KEY}
+    now = datetime.now(LOCAL_TZ)
+    today_str = now.date().isoformat()
+
+    async with httpx.AsyncClient() as client:
+        url = f"https://api.kachelmannwetter.com/v02/forecast/{WEATHER_LAT}/{WEATHER_LON}/3day"
+        resp = await client.get(url, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            log.error("Kachelmann 3-day error: %s %s", resp.status_code, resp.text[:200])
+            return fallback
+
+        data = resp.json()
+        entries = data.get("data", [])
+
+        # Try to find today's entry
+        day_entry = None
+        for entry in entries:
+            if entry.get("dateTime") == today_str:
+                day_entry = entry
+                break
+
+        # Fall back to first entry (tomorrow) if today not available
+        if day_entry is None and entries:
+            day_entry = entries[0]
+
+        if not day_entry:
+            return fallback
+
+        rain_prob = day_entry.get("precProb", 0)
+
+        # Extract period weather symbols if available
+        tod = day_entry.get("timeOfDay", {})
+        periods = None
+        if tod:
+            symbol_map = {
+                "morning": "vormittags",
+                "afternoon": "nachmittags",
+                "evening": "abends",
+            }
+            periods = []
+            for api_key, label in symbol_map.items():
+                period_data = tod.get(api_key, {})
+                symbol = period_data.get("weatherSymbol", "partlycloudy")
+                periods.append({
+                    "label": label,
+                    "condition": _kachelmann_symbol_to_condition(symbol),
+                })
+
+        return {
+            "rain_probability_pct": rain_prob,
+            "periods": periods,
         }
 
 
@@ -223,198 +356,104 @@ def _deg_to_compass(deg) -> str | None:
     return dirs[int((deg + 22.5) / 45) % 8]
 
 
-def _symbol_to_condition(symbol: str) -> str:
-    s = str(symbol).lower()
-    if "rain" in s or "regen" in s or "shower" in s:
+def _kachelmann_symbol_to_condition(symbol: str) -> str:
+    """Map Kachelmann weatherSymbol to our icon condition names."""
+    s = symbol.lower()
+    if "rain" in s or "shower" in s or "thunder" in s or "drizzle" in s:
         return "rainy"
-    if "snow" in s or "schnee" in s:
+    if "snow" in s or "sleet" in s:
         return "snowy"
-    if "cloud" in s or "wolk" in s or "bewölkt" in s:
-        if "partly" in s or "teilweise" in s or "sun" in s:
-            return "partly_cloudy"
+    if s == "partlycloudy" or s == "partly_cloudy":
+        return "partly_cloudy"
+    if "cloud" in s or "overcast" in s:
         return "cloudy"
-    if "sun" in s or "clear" in s or "sonn" in s or "klar" in s:
+    if "sun" in s or "clear" in s or "fair" in s:
         return "sunny"
     return "partly_cloudy"
-
-
-def _symbol_to_text_de(symbol: str) -> str:
-    """Translate Kachelmann weather symbols to German text."""
-    mapping = {
-        "sunny": "Sonnig",
-        "clear": "Klar",
-        "partly cloudy": "Teilweise bewölkt",
-        "partly_cloudy": "Teilweise bewölkt",
-        "cloudy": "Bewölkt",
-        "overcast": "Stark bewölkt",
-        "rainy": "Regen",
-        "rain": "Regen",
-        "snowy": "Schnee",
-        "snow": "Schnee",
-    }
-    return mapping.get(symbol.lower(), symbol.capitalize() if symbol else "Keine Daten")
-
-
-# --- Clothing Recommendations (GPT-5.4 via Langfuse) ---
-
-AVAILABLE_SPRITES = {
-    "KOPF": [
-        {"sprite": "cap", "label": "Mütze"},
-        {"sprite": "nocap", "label": "Ohne"},
-    ],
-    "OBERTEIL": [
-        {"sprite": "raincoat", "label": "Regenjacke"},
-        {"sprite": "longsleeves", "label": "Langarm"},
-        {"sprite": "shortsleeves", "label": "Kurzarm"},
-    ],
-    "HOSE": [
-        {"sprite": "rainpants", "label": "Regenhose"},
-        {"sprite": "pants", "label": "Lange Hose"},
-        {"sprite": "shorts", "label": "Shorts"},
-    ],
-    "HAENDE": [
-        {"sprite": "mittens", "label": "Fäustlinge"},
-        {"sprite": "gloves", "label": "Handschuhe"},
-        {"sprite": "nogloves", "label": "Ohne"},
-    ],
-    "SCHUHE": [
-        {"sprite": "wintershoes", "label": "Winterschuhe"},
-        {"sprite": "sneakers", "label": "Sneakers"},
-    ],
-}
-
-_langfuse_client = None
-
-
-def _get_langfuse():
-    global _langfuse_client
-    if _langfuse_client is None:
-        _langfuse_client = Langfuse()
-    return _langfuse_client
-
-
-def _fallback_clothing() -> tuple[list[ClothingItem], str]:
-    """Safe fallback if LLM call fails."""
-    return [
-        ClothingItem(category="KOPF", sprite="nocap", label="Ohne"),
-        ClothingItem(category="OBERTEIL", sprite="longsleeves", label="Langarm"),
-        ClothingItem(category="HOSE", sprite="pants", label="Lange Hose"),
-        ClothingItem(category="HAENDE", sprite="nogloves", label="Ohne"),
-        ClothingItem(category="SCHUHE", sprite="sneakers", label="Sneakers"),
-    ], ""
-
-
-def recommend_clothing(
-    temps_24h: list[float],
-    rain_24h: list[float],
-    wind_kmh: int | None,
-    current_hour: int,
-    weekday_name: str,
-) -> tuple[list[ClothingItem], str]:
-    """Use GPT-5.4 to recommend clothing based on weather forecast. Returns (items, tip)."""
-    try:
-        langfuse = _get_langfuse()
-        prompt = langfuse.get_prompt("clothing-recommendation")
-        system_msg = prompt.compile()
-
-        # Build hourly forecast with absolute timestamps
-        hourly_forecast = []
-        for i, (t, r) in enumerate(zip(temps_24h, rain_24h)):
-            h = (current_hour + i) % 24
-            day = "Heute" if (current_hour + i) < 24 else "Morgen"
-            hourly_forecast.append(f"{day} {h:02d}h: {t}°C, {r}mm Regen")
-
-        weather_context = json.dumps({
-            "weekday": weekday_name,
-            "current_hour": f"{current_hour:02d}:00",
-            "hourly_forecast": hourly_forecast,
-            "wind_kmh": wind_kmh or 0,
-            "available_categories_and_sprites": AVAILABLE_SPRITES,
-        }, ensure_ascii=False)
-
-        response = langfuse_openai.responses.create(
-            model="gpt-5.4",
-            instructions=system_msg,
-            input=weather_context,
-            langfuse_prompt=prompt,
-        )
-
-        result_text = response.output_text
-        parsed = json.loads(result_text)
-
-        # Support both formats: list (old) or {"items": [...], "tip": "..."} (new)
-        if isinstance(parsed, list):
-            items_data = parsed
-            tip = ""
-        else:
-            items_data = parsed.get("items", [])
-            tip = parsed.get("tip", "")[:100]
-
-        items = []
-        for item in items_data:
-            cat = item["category"]
-            sprite = item["sprite"]
-            valid_sprites = [s["sprite"] for s in AVAILABLE_SPRITES.get(cat, [])]
-            if sprite not in valid_sprites:
-                log.warning("GPT returned invalid sprite %s for %s, skipping", sprite, cat)
-                continue
-            label = next(
-                (s["label"] for s in AVAILABLE_SPRITES[cat] if s["sprite"] == sprite),
-                sprite
-            )
-            items.append(ClothingItem(category=cat, sprite=sprite, label=label))
-
-        if len(items) < 3:
-            log.warning("GPT returned too few items (%d), using fallback", len(items))
-            return _fallback_clothing()
-
-        return items, tip
-
-    except Exception as e:
-        log.error("Clothing LLM error: %s", e)
-        return _fallback_clothing()
 
 
 # --- ZVV Bus Departures ---
 
 
-async def fetch_bus_departures(limit: int = 15) -> list[dict]:
-    """Fetch next bus departures from transport.opendata.ch."""
+def _parse_stationboard(data: dict, line_filter: set | None = None,
+                        dest_filter: set | None = None, limit: int = 30) -> list[dict]:
+    """Parse stationboard response, optionally filtering by line and destination."""
+    departures = []
+    for entry in data.get("stationboard", []):
+        dest = entry.get("to", "?")
+        if dest in HIDDEN_DESTINATIONS:
+            continue
+        line = entry.get("number", entry.get("category", "?"))
+        if line_filter and line not in line_filter:
+            continue
+        if dest_filter and dest not in dest_filter:
+            continue
+        if len(departures) >= limit:
+            break
+        stop = entry.get("stop", {})
+        dep_time = stop.get("departure", "")
+        try:
+            dt = datetime.fromisoformat(dep_time)
+            time_str = dt.strftime("%H:%M")
+            sort_key = dt.isoformat()
+        except (ValueError, TypeError):
+            time_str = dep_time[:5] if dep_time else "??:??"
+            sort_key = time_str
+        departures.append({
+            "line": line, "dest": dest, "time": time_str,
+            "platform": stop.get("platform") or "", "_sort": sort_key,
+        })
+    return departures
+
+
+async def fetch_bus_departures(limit: int = 15, minutes_ahead: int | None = None) -> list[dict]:
+    """Fetch bus/tram departures from main stop + extra stops, merged by time.
+
+    If minutes_ahead is set, only include departures within that time window.
+    """
     url = "https://transport.opendata.ch/v1/stationboard"
-    params = {"station": BUS_STOP_NAME, "limit": limit}
+    now = datetime.now(LOCAL_TZ)
+
+    # If filtering by time, fetch more to ensure we have enough after filtering
+    fetch_limit = max(limit, 50) if minutes_ahead else limit
 
     async with httpx.AsyncClient() as client:
-        resp = await client.get(url, params=params)
+        # Fetch main stop
+        resp = await client.get(url, params={"station": BUS_STOP_NAME, "limit": fetch_limit})
         if resp.status_code != 200:
-            log.error("ZVV API error: %s", resp.status_code)
+            log.error("ZVV API error for %s: %s", BUS_STOP_NAME, resp.status_code)
             return []
+        all_deps = _parse_stationboard(resp.json(), limit=fetch_limit)
 
-        data = resp.json()
-        departures = []
-        for entry in data.get("stationboard", []):
-            dest = entry.get("to", "?")
-            if dest in HIDDEN_DESTINATIONS:
-                continue
-            if len(departures) >= limit:
-                break
-            stop = entry.get("stop", {})
-            dep_time = stop.get("departure", "")
-            # Parse ISO time to HH:MM
+        # Fetch extra stops (filtered by line/destination)
+        for extra in EXTRA_STOPS:
             try:
-                dt = datetime.fromisoformat(dep_time)
-                time_str = dt.strftime("%H:%M")
-            except (ValueError, TypeError):
-                time_str = dep_time[:5] if dep_time else "??:??"
+                resp2 = await client.get(url, params={"station": extra["stop"], "limit": 30})
+                if resp2.status_code == 200:
+                    deps = _parse_stationboard(
+                        resp2.json(),
+                        line_filter=extra.get("lines"),
+                        dest_filter=extra.get("destinations"),
+                        limit=30,
+                    )
+                    all_deps.extend(deps)
+            except Exception as e:
+                log.error("ZVV API error for %s: %s", extra["stop"], e)
 
-            departures.append(
-                {
-                    "line": entry.get("number", entry.get("category", "?")),
-                    "dest": entry.get("to", "?"),
-                    "time": time_str,
-                    "platform": stop.get("platform") or "",
-                }
-            )
-        return departures
+        # Sort all by departure time
+        all_deps.sort(key=lambda d: d["_sort"])
+
+        # Filter by time window if requested
+        if minutes_ahead:
+            from datetime import timedelta
+            cutoff = now + timedelta(minutes=minutes_ahead)
+            cutoff_str = cutoff.isoformat()
+            all_deps = [d for d in all_deps if d["_sort"] <= cutoff_str]
+
+        # Strip internal sort key
+        for d in all_deps:
+            del d["_sort"]
+        return all_deps
 
 
 # --- Refresh Schedule ---
@@ -524,24 +563,33 @@ async def get_dashboard():
         netatmo_ok = False
 
     try:
-        weather = await fetch_weather()
+        weather = await fetch_weather_hourly()
     except Exception as e:
-        log.error("Weather fetch error: %s", e)
+        log.error("Weather hourly fetch error: %s", e)
         weather = {
-            "temp_min": None,
-            "temp_max": None,
-            "wind_kmh": None,
-            "wind_dir": None,
-            "weather_condition": "unknown",
-            "weather_text": "Fehler",
-            "temps_next_24h": [0.0] * 24,
-            "rain_next_24h": [0.0] * 24,
+            "temp_min": None, "temp_max": None,
+            "wind_kmh": None, "wind_dir": None, "wind_gust_kmh": None,
+            "weather_condition": "unknown", "weather_text": "Fehler",
+            "weather_periods": [], "temps_next_24h": [0.0] * 24,
+            "rain_next_24h": [0.0] * 24, "precip_total_mm": 0.0,
         }
         kachelmann_ok = False
 
+    # Fetch 3-day forecast for rain probability and period weather symbols
+    weather_3day = {"rain_probability_pct": 0, "periods": None}
     try:
-        bus_limit = 30 if refresh_mode == "low" else 15
-        bus_deps = await fetch_bus_departures(limit=bus_limit)
+        weather_3day = await fetch_weather_3day()
+    except Exception as e:
+        log.error("Weather 3-day fetch error: %s", e)
+
+    # Use 3-day period symbols if available, otherwise fall back to hourly-derived
+    periods = weather_3day.get("periods") or weather.get("weather_periods", [])
+    rain_prob = weather_3day.get("rain_probability_pct", 0)
+
+    try:
+        bus_deps = await fetch_bus_departures(
+            limit=50, minutes_ahead=sleep_min if refresh_mode == "low" else None,
+        )
     except Exception as e:
         log.error("Bus fetch error: %s", e)
         bus_deps = []
@@ -552,17 +600,11 @@ async def get_dashboard():
     rain_24h = weather.get("rain_next_24h", [0.0] * 24)
     hour_labels = [(now.hour + i) % 24 for i in range(24)]
 
-    # For clothing: use forecast from now until midnight
-    hours_until_midnight = max(24 - now.hour, 1)
-    temps_remaining = temps_24h[:hours_until_midnight]
-    rain_remaining = rain_24h[:hours_until_midnight]
-    max_rain = max(rain_remaining) if rain_remaining else 0
-
-    weekday_names = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
-    clothing, clothing_tip = recommend_clothing(
-        temps_24h, rain_24h, weather.get("wind_kmh"),
-        now.hour, weekday_names[now.weekday()]
-    )
+    # Outdoor temp: prefer Netatmo, fall back to Kachelmann forecast
+    temp_outdoor = netatmo.get("temp_outdoor")
+    if temp_outdoor is None and temps_24h[0] != 0.0:
+        temp_outdoor = temps_24h[0]
+        log.info("Using Kachelmann forecast temp as Netatmo fallback: %.1f", temp_outdoor)
 
     # Build compact departures for low-refresh mode
     bus_departures_compact = format_compact_departures(bus_deps) if refresh_mode == "low" else []
@@ -572,20 +614,21 @@ async def get_dashboard():
         next_update=next_update,
         refresh_mode=refresh_mode,
         sleep_minutes=sleep_min,
-        temp_outdoor=netatmo.get("temp_outdoor"),
+        temp_outdoor=temp_outdoor,
         wind_kmh=weather.get("wind_kmh"),
         wind_dir=weather.get("wind_dir"),
+        wind_gust_kmh=weather.get("wind_gust_kmh"),
         temp_min=weather.get("temp_min"),
         temp_max=weather.get("temp_max"),
-        rain_max_mm=max_rain,
+        rain_probability_pct=rain_prob,
+        precip_total_mm=weather.get("precip_total_mm", 0.0),
         weather_condition=weather.get("weather_condition", "unknown"),
         weather_text=weather.get("weather_text", ""),
+        weather_periods=[WeatherPeriod(**p) for p in periods],
         temp_outdoor_24h=temps_24h,
         rain_mm_24h=rain_24h,
         current_hour=now.hour,
         hour_labels=hour_labels,
-        clothing=clothing,
-        clothing_tip=clothing_tip,
         bus_stop_name=BUS_STOP_NAME,
         bus_departures=[BusDeparture(**d) for d in bus_deps],
         bus_departures_compact=bus_departures_compact,

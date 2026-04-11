@@ -3,7 +3,7 @@ version: '3'
 vars:
   IDF_PATH: ~/esp/esp-idf-v5.3
   HW_DIR: m5paper_hw
-  PORT: /dev/cu.usbmodem101
+  PORT: /dev/cu.usbmodem1101
   IDF_PYTHON: ~/.espressif/python_env/idf5.3_py3.11_env/bin/python
 
 tasks:

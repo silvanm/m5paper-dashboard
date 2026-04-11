@@ -36,13 +36,13 @@ def fetch_data() -> dict | None:
 
 
 def load_weather_icons() -> dict[str, pygame.Surface]:
-    """Load and scale weather icon PNGs."""
+    """Load weather icon PNGs (kept at original size, scaled per use)."""
     icons = {}
     for name in ("sunny", "partly_cloudy", "cloudy", "rainy", "snowy"):
         path = os.path.join(ICONS_DIR, f"{name}.png")
         if os.path.exists(path):
             img = pygame.image.load(path).convert_alpha()
-            icons[name] = pygame.transform.smoothscale(img, (80, 80))
+            icons[name] = img
     return icons
 
 
@@ -52,71 +52,101 @@ def draw_dashboard(screen: pygame.Surface, data: dict, fonts: dict, icons: dict)
     f_md = fonts["md"]
     f_lg = fonts["lg"]
     f_xl = fonts["xl"]
+    f_xxl = fonts["xxl"]
     f_title = fonts["title"]
+    f_stat = fonts["stat"]
+    f_period = fonts["period"]
+
+    left_w = 510
 
     # ====== HEADER ======
-    pygame.draw.rect(screen, BLACK, (0, 0, SCREEN_W, 56))
-    f_title.render_to(screen, (20, 15), "WARDROBE DISPLAY", BG)
+    pygame.draw.rect(screen, BLACK, (0, 0, SCREEN_W, 46))
+    f_title.render_to(screen, (20, 10), "WETTER & ABFAHRTEN", BG)
     ts_text = f"Stand: {data['timestamp']}  ·  Nächstes Update ~{data['next_update']}"
-    f_sm.render_to(screen, (260, 22), ts_text, BG)
+    f_sm.render_to(screen, (280, 16), ts_text, BG)
 
-    # ====== CURRENT TEMPS - LEFT PANEL ======
-    panel_y = 72
-    panel_h = 160
+    # ====== LEFT PANEL — WEATHER ======
+    y = 54
 
-    # Indoor
-    f_sm.render_to(screen, (30, panel_y + 6), "INNEN", DARK)
-    ti = data.get("temp_indoor")
-    f_xl.render_to(screen, (20, panel_y + 36), f"{ti:.0f}°" if ti else "--°", BLACK)
-    hi = data.get("humidity_indoor")
-    co2 = data.get("co2_ppm")
-    f_sm.render_to(screen, (30, panel_y + 118), f"Luftfeucht. {hi}%" if hi else "Luftfeucht. --", MID)
-    f_sm.render_to(screen, (30, panel_y + 138), f"CO₂  {co2} ppm" if co2 else "CO₂  -- ppm", MID)
-
-    # Dashed divider
-    for y in range(panel_y, panel_y + panel_h, 8):
-        pygame.draw.line(screen, LIGHT, (215, y), (215, y + 4), 1)
-
-    # Outdoor
-    f_sm.render_to(screen, (235, panel_y + 6), "AUSSEN", DARK)
+    # -- Row 1: Actual temp (left) + 3 period icons (right) --
+    f_sm.render_to(screen, (24, y + 2), "AKTUELL", MID)
     to = data.get("temp_outdoor")
-    f_xl.render_to(screen, (230, panel_y + 36), f"{to:.0f}°" if to else "--°", BLACK)
-    ho = data.get("humidity_outdoor")
-    wind = data.get("wind_kmh")
-    wdir = data.get("wind_dir") or ""
-    f_sm.render_to(screen, (235, panel_y + 118), f"Luftfeucht. {ho}%" if ho else "Luftfeucht. --", MID)
-    f_sm.render_to(screen, (235, panel_y + 138), f"Wind {wind} km/h {wdir}" if wind else "Wind --", MID)
+    f_xxl.render_to(screen, (20, y + 18), f"{to:.1f}°" if to is not None else "--°", BLACK)
 
-    # Weather icon (bitmap)
-    cond = data.get("weather_condition", "unknown")
-    icon = icons.get(cond) or icons.get("partly_cloudy")
-    if icon:
-        screen.blit(icon, (430, panel_y + 10))
+    # Three period weather icons
+    icon_size = 80
+    icon_start_x = 210
+    col_w = 100
+    periods = data.get("weather_periods", [])
 
-    # Min/Max + condition text
-    tmin = data.get("temp_min")
+    for i, p in enumerate(periods[:3]):
+        cx = icon_start_x + i * col_w
+        box_w = 90
+
+        pygame.draw.rect(screen, FAINT, (cx, y, box_w, icon_size + 24), border_radius=5)
+        pygame.draw.rect(screen, LIGHT, (cx, y, box_w, icon_size + 24), width=1, border_radius=5)
+
+        icon_surf = icons.get(p.get("condition", "partly_cloudy")) or icons.get("partly_cloudy")
+        if icon_surf:
+            scaled = pygame.transform.smoothscale(icon_surf, (icon_size, icon_size))
+            screen.blit(scaled, (cx + (box_w - icon_size) // 2, y + 2))
+
+        lbl = p.get("label", "")
+        lbl_rect = f_period.get_rect(lbl)
+        f_period.render_to(screen, (cx + (box_w - lbl_rect.width) // 2, y + icon_size + 6), lbl, DARK)
+
+    # Vertical separators between icon boxes
+    for i in range(1, 3):
+        sx = icon_start_x + i * col_w - 5
+        pygame.draw.line(screen, LIGHT, (sx, y + 10), (sx, y + icon_size + 14), 1)
+
+    y += icon_size + 32
+
+    # -- Row 2: Stats — max/min + rain/wind/gusts/precip --
+    pygame.draw.line(screen, LIGHT, (20, y), (left_w - 10, y), 1)
+    y += 8
+
+    # Left: max / min
     tmax = data.get("temp_max")
-    minmax = f"↓ {tmin:.0f}°  ↑ {tmax:.0f}°" if tmin is not None and tmax is not None else "-- / --"
-    f_md.render_to(screen, (430, panel_y + 100), minmax, DARK)
-    f_sm.render_to(screen, (430, panel_y + 122), data.get("weather_text", ""), MID)
+    tmin = data.get("temp_min")
+    f_stat.render_to(screen, (24, y + 4), "max", MID)
+    f_xl.render_to(screen, (64, y - 4), f"{tmax:.0f}°" if tmax is not None else "--°", BLACK)
+    f_stat.render_to(screen, (24, y + 46), "min", MID)
+    f_xl.render_to(screen, (64, y + 38), f"{tmin:.0f}°" if tmin is not None else "--°", BLACK)
 
-    # ====== SEPARATOR ======
-    pygame.draw.line(screen, LIGHT, (20, panel_y + panel_h + 8), (530, panel_y + panel_h + 8), 1)
+    # Right: rain %, wind, gusts, precip
+    rc_x = 240
+    row_h = 22
 
-    # ====== CHART AREA ======
-    chart_x = 55
-    chart_y = 270
-    chart_w = 470
-    chart_h = 175
-    chart_bottom = chart_y + chart_h
+    rain_pct = data.get("rain_probability_pct", 0)
+    wind = data.get("wind_kmh")
+    gust = data.get("wind_gust_kmh")
+    precip = data.get("precip_total_mm", 0)
 
-    f_md.render_to(screen, (20, chart_y - 20), "TEMPERATUR & REGEN  —  24h", BLACK)
+    f_lg.render_to(screen, (rc_x, y), f"Regen  {rain_pct}%", BLACK)
+    f_stat.render_to(screen, (rc_x, y + row_h + 6), f"↗ Wind  {wind} km/h" if wind else "↗ Wind  --", DARK)
+    f_stat.render_to(screen, (rc_x, y + (row_h + 6) * 2), f"⇉ Böen  {gust} km/h" if gust else "⇉ Böen  --", DARK)
+    f_stat.render_to(screen, (rc_x, y + (row_h + 6) * 3), f"☂ Niederschlag  {precip:.1f} mm", DARK)
+
+    y += 100
+
+    # -- Row 3: 24h Temperature & Rain chart --
+    pygame.draw.line(screen, LIGHT, (20, y), (left_w - 10, y), 1)
+    y += 6
+
+    f_md.render_to(screen, (20, y), "TEMPERATUR & REGEN  —  24h", BLACK)
+    y += 20
+
+    chart_x = 50
+    chart_w = left_w - 80
+    chart_h = 155
+    chart_bottom = y + chart_h
 
     temps = data.get("temp_outdoor_24h", [0] * 24)
-    rain = data.get("rain_prob_24h", [0] * 24)
+    rain = data.get("rain_mm_24h", [0] * 24)
     hour_labels = data.get("hour_labels", list(range(24)))
 
-    # Y-axis range (outdoor temps only, no indoor)
+    # Y-axis range
     valid_temps = [t for t in temps if t != 0]
     if valid_temps:
         temp_min_chart = min(min(valid_temps) - 2, 0)
@@ -127,72 +157,74 @@ def draw_dashboard(screen: pygame.Surface, data: dict, fonts: dict, icons: dict)
 
     # Y-axis labels + grid
     for t in range(int(temp_min_chart), int(temp_max_chart) + 1, 5):
-        y = int(chart_bottom - ((t - temp_min_chart) / temp_range) * chart_h)
-        f_sm.render_to(screen, (chart_x - 35, y - 5), f"{t}°", MID)
-        pygame.draw.line(screen, FAINT, (chart_x, y), (chart_x + chart_w, y), 1)
+        cy = int(chart_bottom - ((t - temp_min_chart) / temp_range) * chart_h)
+        f_sm.render_to(screen, (chart_x - 30, cy - 5), f"{t}°", MID)
+        pygame.draw.line(screen, FAINT, (chart_x, cy), (chart_x + chart_w, cy), 1)
 
     # X-axis labels
     for i in range(0, 24, 3):
         x = chart_x + int((i / 23) * chart_w)
-        f_sm.render_to(screen, (x - 8, chart_bottom + 6), f"{hour_labels[i]:02d}", MID)
+        f_sm.render_to(screen, (x - 8, chart_bottom + 4), f"{hour_labels[i]:02d}", MID)
 
-    # Rain probability bars
+    # Rain bars (mm-based, graduated shading)
     bar_w = max(chart_w // 24 - 2, 4)
+    rain_scale = max(max(rain) if rain else 1, 2)  # scale to max rain or 2mm
     for i in range(24):
-        if rain[i] > 0:
+        if rain[i] > 0.05:
             x = chart_x + int((i / 23) * chart_w) - bar_w // 2
-            bar_h = int((rain[i] / 100) * chart_h)
-            y = chart_bottom - bar_h
-            # Graduated shading based on probability
-            if rain[i] > 60:
+            bar_h = int((rain[i] / rain_scale) * chart_h)
+            if bar_h < 2:
+                bar_h = 2
+            by = chart_bottom - bar_h
+            if rain[i] > 5.0:
                 color = LIGHT
-            elif rain[i] > 30:
+            elif rain[i] > 1.0:
                 color = FAINT
             else:
-                # Very light for low probability
                 color = (218, 215, 206)
-            pygame.draw.rect(screen, color, (x, y, bar_w, bar_h))
-            if rain[i] > 40:
-                for hy in range(y, chart_bottom, 4):
+            pygame.draw.rect(screen, color, (x, by, bar_w, bar_h))
+            if rain[i] > 2.0:
+                for hy in range(by, chart_bottom, 4):
                     pygame.draw.line(screen, MID, (x, hy), (x + bar_w, hy), 1)
 
-    # Rain % Y-axis (right)
-    for p in range(0, 101, 25):
-        y = int(chart_bottom - (p / 100) * chart_h)
-        f_sm.render_to(screen, (chart_x + chart_w + 8, y - 5), f"{p}%", LIGHT)
+    # Rain mm Y-axis (right)
+    for mm in range(0, int(rain_scale) + 1, max(1, int(rain_scale) // 4)):
+        ry = int(chart_bottom - (mm / rain_scale) * chart_h)
+        f_sm.render_to(screen, (chart_x + chart_w + 6, ry - 5), f"{mm}mm", LIGHT)
 
-    # Temperature line - Outdoor (solid, smooth)
-    points_out = []
+    # Temperature line
+    points = []
     for i in range(24):
-        x = chart_x + int((i / 23) * chart_w)
-        y = int(chart_bottom - ((temps[i] - temp_min_chart) / temp_range) * chart_h)
-        points_out.append((x, y))
-    if len(points_out) > 1:
-        pygame.draw.lines(screen, BLACK, False, points_out, 3)
+        px = chart_x + int((i / 23) * chart_w)
+        py = int(chart_bottom - ((temps[i] - temp_min_chart) / temp_range) * chart_h)
+        points.append((px, py))
+    if len(points) > 1:
+        pygame.draw.lines(screen, BLACK, False, points, 3)
 
-    # "Now" marker — at left edge of chart
+    # "Now" marker
     now_x = chart_x + 2
-    for dy in range(chart_y + 4, chart_bottom, 4):
+    for dy in range(y, chart_bottom, 4):
         pygame.draw.line(screen, MID, (now_x, dy), (now_x, min(dy + 2, chart_bottom)), 1)
-    f_sm.render_to(screen, (now_x + 4, chart_y + 2), "JETZT", BLACK)
-    if points_out:
-        pygame.draw.circle(screen, BLACK, points_out[0], 5)
-        pygame.draw.circle(screen, BG, points_out[0], 2)
+    f_sm.render_to(screen, (now_x + 4, y), "JETZT", BLACK)
+    if points:
+        pygame.draw.circle(screen, BLACK, points[0], 5)
+        pygame.draw.circle(screen, BG, points[0], 2)
 
     # Legend
-    leg_y = chart_bottom + 30
+    leg_y = chart_bottom + 18
     pygame.draw.line(screen, BLACK, (chart_x, leg_y), (chart_x + 24, leg_y), 3)
     f_sm.render_to(screen, (chart_x + 30, leg_y - 5), "Temperatur", DARK)
     pygame.draw.rect(screen, FAINT, (chart_x + 120, leg_y - 6, 16, 12))
-    f_sm.render_to(screen, (chart_x + 142, leg_y - 5), "Regen %", DARK)
+    f_sm.render_to(screen, (chart_x + 142, leg_y - 5), "Regen mm", DARK)
 
-    # ====== RIGHT PANEL - BUS DEPARTURES ======
-    bus_x = 570
-    bus_y = 72
-    bus_w = 370
+    # ====== VERTICAL DIVIDER ======
+    div_x = left_w + 10
+    pygame.draw.line(screen, LIGHT, (div_x, 56), (div_x, SCREEN_H - 30), 2)
 
-    # Vertical divider
-    pygame.draw.line(screen, LIGHT, (bus_x - 20, 66), (bus_x - 20, SCREEN_H - 30), 2)
+    # ====== RIGHT PANEL — BUS DEPARTURES ======
+    bus_x = div_x + 20
+    bus_y = 56
+    bus_w = SCREEN_W - bus_x - 10
 
     # Bus header
     pygame.draw.rect(screen, BLACK, (bus_x, bus_y, bus_w, 34))
@@ -204,11 +236,12 @@ def draw_dashboard(screen: pygame.Surface, data: dict, fonts: dict, icons: dict)
     # Bus entries
     departures = data.get("bus_departures", [])
     entry_h = 52
-    # Max destination width: bus_w - badge(66) - time(90) - padding
     max_dest_w = bus_w - 66 - 90 - 10
 
     for i, dep in enumerate(departures):
         ey = bus_y + 44 + i * entry_h
+        if ey + entry_h > SCREEN_H - 40:
+            break
 
         if i % 2 == 0:
             pygame.draw.rect(screen, FAINT, (bus_x, ey, bus_w, entry_h - 2))
@@ -266,13 +299,15 @@ def main():
     screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
     pygame.display.set_caption("M5PaperS3 Dashboard Simulator")
 
-    # Fonts — Helvetica Neue for a clean, modern look
     fonts = {
         "sm": pygame.freetype.SysFont("Helvetica Neue", 13),
         "md": pygame.freetype.SysFont("Helvetica Neue", 15, bold=True),
         "lg": pygame.freetype.SysFont("Helvetica Neue", 22, bold=True),
-        "xl": pygame.freetype.SysFont("Helvetica Neue", 64, bold=True),
+        "xl": pygame.freetype.SysFont("Helvetica Neue", 48, bold=True),
+        "xxl": pygame.freetype.SysFont("Helvetica Neue", 64, bold=True),
         "title": pygame.freetype.SysFont("Helvetica Neue", 22, bold=True),
+        "stat": pygame.freetype.SysFont("Helvetica Neue", 18),
+        "period": pygame.freetype.SysFont("Helvetica Neue", 14),
     }
 
     icons = load_weather_icons()
